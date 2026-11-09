@@ -55,6 +55,22 @@ static void ApplyLive() {
     }
 }
 
+// The Bibata folders are named Bibata-<shape>-<tint>-Regular; Settings offers the
+// parts as separate controls.
+static const int kCursorSizes[] = {32, 48, 64, 96};
+static const wchar_t *const kCursorShapes[] = {L"Modern", L"Original"};
+static const wchar_t *const kCursorTints[] = {L"Classic", L"Ice", L"Amber"};
+static int CursorPart(const wchar_t *const *names, int n) {
+    for (int i = 0; i < n; i++) if (g_set.cursor.find(names[i]) != std::wstring::npos) return i;
+    return 0;
+}
+static void SetCursorParts(int shape, int tint) {
+    if (shape < 0 || shape > 1 || tint < 0 || tint > 2) return;
+    g_set.cursor = std::wstring(L"Bibata-") + kCursorShapes[shape] + L"-" + kCursorTints[tint] + L"-Regular";
+    ThemeApplyCursors();
+    ApplyLive();
+}
+
 void SettingsWin::BuildPages() {
     pages.clear();
     // -------- Appearance
@@ -67,36 +83,18 @@ void SettingsWin::BuildPages() {
     ap.rows.push_back({C_SWITCH, L"Golden Gate wallpaper", L"Change the desktop to match light and dark",
         []() { return g_set.applyWallpaper; }, [](int v) { g_set.applyWallpaper = v; if (v) ThemeApply(true); ApplyLive(); }});
     ap.rows.push_back({C_HEADER, L"Pointer"});
-    static std::vector<std::wstring> cursorNames;
-    cursorNames.clear();
-    {
-        std::wstring dir = JoinPath(g_dir, L"cursors");
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW(JoinPath(dir, L"*").c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.')
-                    cursorNames.push_back(fd.cFileName);
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-    }
-    {
-        std::vector<std::wstring> pretty;
-        for (auto &c : cursorNames) {
-            std::wstring p = c;
-            size_t pos;
-            while ((pos = p.find(L'-')) != std::wstring::npos) p[pos] = L' ';
-            pretty.push_back(p);
-        }
-        ap.rows.push_back({C_CHOICE, L"Cursor", L"Bibata cursor style",
-            []() {
-                for (int i = 0; i < (int)cursorNames.size(); i++) if (cursorNames[i] == g_set.cursor) return i;
-                return 0;
-            },
-            [](int v) { if (v >= 0 && v < (int)cursorNames.size()) { g_set.cursor = cursorNames[v]; ThemeApplyCursors(); ApplyLive(); } },
-            pretty});
-    }
+    ap.rows.push_back({C_SEG, L"Style", L"Bibata Modern has rounded tips; Original has sharp ones",
+        []() { return CursorPart(kCursorShapes, 2); },
+        [](int v) { SetCursorParts(v, CursorPart(kCursorTints, 3)); },
+        {L"Modern", L"Original"}});
+    ap.rows.push_back({C_SEG, L"Colour", L"Classic is black, Ice is white, Amber is gold",
+        []() { return CursorPart(kCursorTints, 3); },
+        [](int v) { SetCursorParts(CursorPart(kCursorShapes, 2), v); },
+        {L"Classic", L"Ice", L"Amber"}});
+    ap.rows.push_back({C_SEG, L"Size", L"32, 48, 64 or 96 pixels, all drawn from Bibata's own artwork",
+        []() { for (int i = 0; i < 4; i++) if (kCursorSizes[i] == g_set.cursorSize) return i; return 0; },
+        [](int v) { if (v >= 0 && v < 4) { g_set.cursorSize = kCursorSizes[v]; ThemeApplyCursors(); ApplyLive(); } },
+        {L"Small", L"Medium", L"Large", L"Huge"}});
     pages.push_back(ap);
 
     // -------- Menu Bar
@@ -399,7 +397,16 @@ struct Dialog : Surface {
     void OnMouse(UINT msg, float x, float y, WPARAM) override;
     void OnKey(UINT vk) override { if (vk == VK_ESCAPE) Close(); if (vk == VK_RETURN) { auto f = onOk; Close(); if (f) f(); } }
     void OnActivate(bool a) override { if (!a) Close(); }
-    void Close() { Show(false); Destroy(); delete this; }
+    // Close once. Hiding/destroying the focused window makes Windows send a
+    // "deactivated" message straight back into OnActivate -> Close; without the
+    // guard that deleted the dialog twice and crashed (Empty Trash, Restart...).
+    bool closing = false;
+    void Close() {
+        if (closing) return;
+        closing = true;
+        Destroy();          // detaches us from the window first, so no re-entry
+        delete this;
+    }
 };
 
 void Dialog::OnPaint() {
@@ -461,6 +468,6 @@ void ShowConfirm(const std::wstring &title, const std::wstring &body, const std:
     OpenDialog(title, body, okText, ok, false);
 }
 void ShowAbout() {
-    OpenDialog(L"About", L"Version 1.0\n\nA desktop layer that runs beside Windows. Nothing in Windows is patched.\n\nIncludes Bibata cursors and MacTahoe icons (GPL-3.0) and the Inter font (OFL). Golden Gate is not affiliated with Apple.",
+    OpenDialog(L"About", L"Version 2.3\n\nA desktop layer that runs beside Windows. Nothing in Windows is patched.\n\nIncludes Bibata cursors and MacTahoe icons (GPL-3.0) and the Inter font (OFL). Golden Gate is not affiliated with Apple.",
                L"OK", nullptr, true);
 }

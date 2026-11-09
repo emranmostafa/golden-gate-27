@@ -66,6 +66,7 @@ struct Settings {
     int lightHour = 7, darkHour = 19;
     unsigned accent = 0x3478F6; // RGB
     std::wstring cursor = L"Bibata-Modern-Classic-Regular";
+    int cursorSize = 32;        // px: 32, 48, 64 or 96 (sizes every Bibata file has art for)
     bool applyCursors = true, applyWallpaper = true, applyAccent = true;
     // menu bar / panel
     bool menubar = true, clock24 = false, clockSeconds = false, clockDate = true, clockCenter = true;
@@ -84,7 +85,7 @@ struct Settings {
     int iconStyle = 0;          // app icons: 0 original (as the taskbar shows), 1 macOS-style set
     std::vector<std::wstring> pinned;   // AppsFolder parsing names
     // features
-    bool missionControl = true, hotCorner = true, switcher = true, spotlight = true;
+    bool missionControl = true, hotCorner = true, switcher = false, spotlight = true;
     bool launchpad = true, clipboard = true, shakeFind = true, caffeine = false;
     // Windows taskbar: 0 leave as is, 1 auto-hide, 2 hide completely
     int taskbar = 2;
@@ -127,6 +128,7 @@ D2D1_COLOR_F Mix(D2D1_COLOR_F a, D2D1_COLOR_F b, float t);
 IWICBitmapSource *LoadWicFile(const std::wstring &path);
 IWICBitmapSource *WicFromHBitmap(HBITMAP hb);
 IWICBitmapSource *WicFromHIcon(HICON hi);
+IWICBitmapSource *NormalizeIcon(IWICBitmapSource *src);   // cached: same optical size for every icon
 
 // A top-level window drawn with Direct2D.
 //  - Glass: Windows 11 acrylic backdrop behind our drawing (menu bar, menus,
@@ -185,11 +187,16 @@ struct AppEntry {
     std::wstring name;      // display name
     std::wstring exe;       // target exe (desktop apps), lower-case
     std::wstring aumid;     // lower-case
+    PIDLIST_ABSOLUTE pidl = nullptr;   // the Start-menu item itself (icon + launch), owned by the app list
 };
 std::vector<AppEntry> &AllApps(bool refresh = false);
 const AppEntry *FindApp(const std::wstring &id);
+const AppEntry *FindAppForWindow(const std::wstring &aumid, const std::wstring &exe);   // app ID wins over exe
+std::wstring CanonicalAppId(const std::wstring &id);   // bare "app.exe" pins -> their Start-menu id
 void LaunchApp(const std::wstring &id);
-IWICBitmapSource *AppIcon(const std::wstring &id, int size = 128);   // cached, themed (MacTahoe) when known
+// cached. bundledFallback=false leaves it null when the shell has no icon, so a
+// running app can try its real window icon before the bundled set.
+IWICBitmapSource *AppIcon(const std::wstring &id, int size = 128, bool bundledFallback = true);
 IWICBitmapSource *IconForExe(const std::wstring &exe, const std::wstring &aumid, int size = 128);
 IWICBitmapSource *ThemedIcon(const std::wstring &key);                // assets/icons/<key>.png
 IWICBitmapSource *ShellItemIcon(const std::wstring &parseName, int size = 128);   // file path or shell:AppsFolder\id
@@ -215,7 +222,8 @@ void LaunchpadToggle();
 void SpotlightToggle();
 void ClipboardStart(); void ClipboardStop(); void ClipboardShow(RECT anchor);
 void CaffeineSet(bool on);
-void ShakeAndCornersTick();
+void ShakeTimerTick();
+void HotCornersTick();
 void TaskbarApply();   void TaskbarRestore();
 void SettingsOpen();
 HWND SettingsHwnd();

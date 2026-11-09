@@ -7,7 +7,7 @@ Unicode true
 !include "FileFunc.nsh"
 
 !define APP "Golden Gate"
-!define VER "1.0.0"
+!define VER "2.3.0"
 !define EXE "GoldenGate.exe"
 
 Name "${APP}"
@@ -36,12 +36,15 @@ BrandingText "${APP} ${VER}"
 !insertmacro MUI_LANGUAGE "English"
 
 Function .onInit
-  ; close a running copy before replacing files
-  FindWindow $0 "GoldenGateMain" ""
-  StrCmp $0 0 done
-  SendMessage $0 16 0 0 ; WM_CLOSE
-  Sleep 800
-done:
+  ; Close a running copy before replacing files, or Windows keeps the old exe and
+  ; the update silently doesn't apply. Golden Gate's main window is message-only,
+  ; which FindWindow can't see, so ask the installed exe to quit the running one
+  ; cleanly, then make sure (older builds don't know --quit).
+  IfFileExists "$INSTDIR\${EXE}" 0 +2
+    ExecWait '"$INSTDIR\${EXE}" --quit'
+  nsExec::Exec 'taskkill /F /IM ${EXE}'
+  Pop $0
+  Sleep 700
 FunctionEnd
 
 Section "Golden Gate" SecMain
@@ -103,10 +106,10 @@ SectionEnd
 
 Section "Uninstall"
   ; stop the app, then put Windows' look back before deleting files
-  FindWindow $0 "GoldenGateMain" ""
-  StrCmp $0 0 +3
-  SendMessage $0 16 0 0
-  Sleep 800
+  ExecWait '"$INSTDIR\${EXE}" --quit'
+  nsExec::Exec 'taskkill /F /IM ${EXE}'
+  Pop $0
+  Sleep 500
   ExecWait '"$INSTDIR\${EXE}" --restore'
   Sleep 400
 

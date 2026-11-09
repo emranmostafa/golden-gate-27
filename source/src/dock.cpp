@@ -63,6 +63,36 @@ bool DownloadsFanOpen();
 // own hi-res icon, then the window's icon. Cached per app so the once-a-second
 // Dock refresh never re-extracts (the old path leaked a new bitmap every rebuild)
 // and never blocks on a hung app (timeout instead of a plain SendMessage).
+// A window can name its taskbar icon itself via System.AppUserModel.
+// RelaunchIconResource ("path,index" or "path,-resourceId"); the taskbar uses it,
+// so do we. Extracted at 128px rather than the taskbar's small size.
+static const PROPERTYKEY GG_PKEY_RelaunchIconResource =
+    {{0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 3};
+static IWICBitmapSource *RelaunchIcon(HWND w) {
+    IPropertyStore *ps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(w, IID_PPV_ARGS(&ps))) || !ps) return nullptr;
+    IWICBitmapSource *icon = nullptr;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    if (SUCCEEDED(ps->GetValue(GG_PKEY_RelaunchIconResource, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal && *pv.pwszVal) {
+        std::wstring res = pv.pwszVal;
+        int index = 0;
+        size_t comma = res.rfind(L',');
+        if (comma != std::wstring::npos) { index = _wtoi(res.c_str() + comma + 1); res = res.substr(0, comma); }
+        res.erase(std::remove(res.begin(), res.end(), L'"'), res.end());
+        wchar_t path[MAX_PATH];
+        ExpandEnvironmentStringsW(res.c_str(), path, MAX_PATH);
+        HICON big = nullptr;
+        if (SHDefExtractIconW(path, index, 0, &big, nullptr, MAKELONG(128, 16)) == S_OK && big) {
+            icon = WicFromHIcon(big);   // copies the pixels
+            DestroyIcon(big);
+        }
+    }
+    PropVariantClear(&pv);
+    ps->Release();
+    return icon;
+}
+
 static IWICBitmapSource *RunningIcon(const std::wstring &key, HWND w) {
     static std::map<std::wstring, IWICBitmapSource *> cache;
     std::wstring ck = (g_set.iconStyle ? L"t:" : L"o:") + key;
@@ -72,7 +102,12 @@ static IWICBitmapSource *RunningIcon(const std::wstring &key, HWND w) {
     HWND real = RealAppWindow(w);
     std::wstring aumid = WindowAumid(real);
     std::wstring exe = WindowExe(w);
-    if (g_set.iconStyle) icon = IconForExe(exe, aumid, 128);   // macOS-style set first
+    // same order as the taskbar: the icon the window names for itself, then its
+    // app-list entry by app ID, then the program's own icon, then the window icon.
+    // (macOS style puts the bundled set first; File Explorer always keeps Finder.)
+    if (g_set.iconStyle || exe == L"explorer.exe") icon = IconForExe(exe, aumid, 128);
+    if (!icon) icon = RelaunchIcon(real);
+    if (!icon && real != w) icon = RelaunchIcon(w);
     if (!icon && !aumid.empty()) icon = ShellItemIcon(L"shell:AppsFolder\\" + aumid, 128);
     if (!icon && exe != L"applicationframehost.exe") {
         DWORD pid = 0;
@@ -125,6 +160,16 @@ void Dock::Rebuild() {
         for (auto &o : old) if (o.id == id) return o.curSize;
         return (float)base;
     };
+    // migrate pins saved under a bare exe name to their real app id
+    bool pinsChanged = false;
+    std::vector<std::wstring> pins;
+    for (auto &pid : g_set.pinned) {
+        std::wstring c = CanonicalAppId(pid);
+        if (c != pid) pinsChanged = true;
+        if (std::find(pins.begin(), pins.end(), c) == pins.end()) pins.push_back(c);
+        else pinsChanged = true;
+    }
+    if (pinsChanged) { g_set.pinned = pins; SaveSettings(); }
     // pinned first
     for (auto &pid : g_set.pinned) {
         DockItem it;
@@ -132,7 +177,7 @@ void Dock::Rebuild() {
         it.pinned = true;
         const AppEntry *a = FindApp(pid);
         it.label = a ? a->name : FileNameOf(pid);
-        it.icon = AppIcon(pid, 128);
+        it.icon = AppIcon(pid, 128, false);
         it.curSize = prevSize(pid);
         items.push_back(it);
     }
@@ -146,10 +191,8 @@ void Dock::Rebuild() {
         groups[key].push_back(w.hwnd);
         if (!groupId.count(key)) {
             // find a matching app id for launching/icon
-            std::wstring id;
-            for (auto &a : AllApps())
-                if ((!w.aumid.empty() && a.aumid == w.aumid) || (!a.exe.empty() && a.exe == w.exe)) { id = a.id; break; }
-            if (id.empty()) id = !w.aumid.empty() ? w.aumid : w.exe;
+            const AppEntry *match = FindAppForWindow(w.aumid, w.exe);
+            std::wstring id = match ? match->id : !w.aumid.empty() ? w.aumid : w.exe;
             groupId[key] = id;
         }
     }
@@ -171,14 +214,17 @@ void Dock::Rebuild() {
         it.windows = g.second;
         const AppEntry *a = FindApp(id);
         it.label = a ? a->name : AppNameFor(g.second[0]);
-        it.icon = AppIcon(id, 128);
+        it.icon = AppIcon(id, 128, false);
         if (!it.icon && !g.second.empty()) it.icon = RunningIcon(g.first, g.second[0]);
         it.curSize = prevSize(id);
         items.push_back(it);
     }
     // pinned apps whose app-list icon didn't resolve: use the running window's
-    for (auto &it : items)
+    // and the bundled set only when the app has no icon of its own anywhere
+    for (auto &it : items) {
         if (!it.icon && !it.windows.empty()) it.icon = RunningIcon(it.id, it.windows[0]);
+        if (!it.icon) it.icon = AppIcon(it.id, 128);
+    }
     // Golden Gate's own Settings window, shown as a running app while it's open
     HWND gs = SettingsHwnd();
     if (gs) {
@@ -407,7 +453,7 @@ void Dock::OnPaint() {
         float iconY = baseline - s;
         float bounce = it.bounce > 0 ? sinf(it.bounce * 3.14159f) * 18 : 0;
         D2D1_RECT_F ir = D2D1::RectF(x, iconY - bounce, x + s, iconY + s - bounce);
-        if (it.icon) Bitmap(it.icon, ir);
+        if (it.icon) Bitmap(NormalizeIcon(it.icon), ir);
         else { Fill(ir, g_pal.hover, s * 0.22f); Text(it.label.substr(0, 1), ir, g_pal.text, s * 0.4f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER); }
         if (it.running)
             Circle(x + s / 2, h - 5, 2.2f, g_pal.textDim, true);
@@ -514,7 +560,10 @@ void Dock::Activate(int i, bool rightClick) {
             std::vector<MenuItem> m = {
                 {L"Open Recycle Bin", L"", []() { ShellOpen(L"shell:RecycleBinFolder"); }},
                 {L"Empty Recycle Bin…", L"", []() { ShowConfirm(L"Empty Trash", L"Permanently delete everything in the Recycle Bin?", L"Empty",
-                    []() { SHEmptyRecycleBinW(nullptr, nullptr, 0); if (g_dock) g_dock->Rebuild(); }); }},
+                    []() {   // we already asked, so don't make Windows ask again
+                        SHEmptyRecycleBinW(nullptr, nullptr, SHERB_NOCONFIRMATION);
+                        if (g_dock) g_dock->Rebuild();
+                    }); }},
             };
             RECT a; GetWindowRect(hwnd, &a);
             PopupMenu(m, a.left + (int)(x_of(i) * scale), a.top, hwnd);

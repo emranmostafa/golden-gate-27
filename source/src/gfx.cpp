@@ -153,8 +153,9 @@ IWICBitmapSource *LoadWicFile(const std::wstring &path) {
 IWICBitmapSource *WicFromHBitmap(HBITMAP hb) {
     if (!hb) return nullptr;
     IWICBitmap *b = nullptr;
-    // shell thumbnails come premultiplied with alpha
-    g_wic->CreateBitmapFromHBITMAP(hb, nullptr, WICBitmapUsePremultipliedAlpha, &b);
+    // shell icons are straight alpha (colour channels exceed alpha on their edges).
+    // Reading them as premultiplied drew corner pixels far too bright: a jagged fringe.
+    g_wic->CreateBitmapFromHBITMAP(hb, nullptr, WICBitmapUseAlpha, &b);
     return ToPbgra(b);
 }
 IWICBitmapSource *WicFromHIcon(HICON hi) {
@@ -162,6 +163,67 @@ IWICBitmapSource *WicFromHIcon(HICON hi) {
     IWICBitmap *b = nullptr;
     g_wic->CreateBitmapFromHICON(hi, &b);
     return ToPbgra(b);
+}
+
+// An exe with no large icon comes back from the shell as its small icon centred on
+// a blank, square-cornered white page. Spot that page: opaque near-white all round
+// a ring 20% in, and still opaque right by the corners (a real white app tile has
+// rounded corners, so it's transparent there and is left alone).
+static bool IsBlankPage(const std::vector<BYTE> &px, int w, int h) {
+    auto at = [&](int x, int y) { return &px[(size_t)y * w * 4 + (size_t)x * 4]; };
+    if (w != h || w < 64) return false;
+    int c = w * 3 / 100;
+    if (at(c, c)[3] < 200 || at(w - 1 - c, h - 1 - c)[3] < 200) return false;
+    int a = w / 5, b = w - 1 - a;
+    for (int i = a; i <= b; i += std::max(1, (b - a) / 16)) {
+        const BYTE *p[4] = {at(i, a), at(i, b), at(a, i), at(b, i)};
+        for (auto q : p) if (q[3] < 200 || q[0] < 235 || q[1] < 235 || q[2] < 235) return false;
+    }
+    return true;
+}
+
+// Windows icons have no shared safe area: some fill their canvas, others (the
+// bundled set) leave 10-25% empty, so equal-sized squares look like unequal icons.
+// Trim each to its visible artwork and re-pad so the longest side is the same share
+// of a square canvas. Pixels are only moved, never resampled, so nothing softens.
+IWICBitmapSource *NormalizeIcon(IWICBitmapSource *src) {
+    static std::map<IWICBitmapSource *, IWICBitmapSource *> cache;
+    if (!src) return nullptr;
+    auto f = cache.find(src);
+    if (f != cache.end()) return f->second;
+    IWICBitmapSource *out = src;
+    UINT uw = 0, uh = 0;
+    src->GetSize(&uw, &uh);
+    int w = (int)uw, h = (int)uh;
+    std::vector<BYTE> px((size_t)w * h * 4);
+    if (w && h && SUCCEEDED(src->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
+        bool page = IsBlankPage(px, w, h);
+        int skip = page ? w / 10 : 0;   // ignore the page's own border
+        int x0 = w, y0 = h, x1 = -1, y1 = -1;
+        for (int y = skip; y < h - skip; y++)
+            for (int x = skip; x < w - skip; x++) {
+                const BYTE *p = &px[(size_t)y * w * 4 + (size_t)x * 4];
+                bool ink = page ? (p[0] < 235 || p[1] < 235 || p[2] < 235) : p[3] > 32;
+                if (!ink) continue;
+                x0 = std::min(x0, x); x1 = std::max(x1, x);
+                y0 = std::min(y0, y); y1 = std::max(y1, y);
+            }
+        if (x1 >= 0) {
+            int cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+            int canvas = (int)ceilf(std::max(cw, ch) / 0.86f);   // artwork = 86%, as the bundled set
+            std::vector<BYTE> dst((size_t)canvas * canvas * 4, 0);
+            int ox = (canvas - cw) / 2, oy = (canvas - ch) / 2;
+            for (int y = 0; y < ch; y++)
+                memcpy(&dst[(size_t)(y + oy) * canvas * 4 + (size_t)ox * 4],
+                       &px[(size_t)(y + y0) * w * 4 + (size_t)x0 * 4], (size_t)cw * 4);
+            IWICBitmap *b = nullptr;
+            if (SUCCEEDED(g_wic->CreateBitmapFromMemory(canvas, canvas, GUID_WICPixelFormat32bppPBGRA, canvas * 4,
+                                                        (UINT)dst.size(), dst.data(), &b)) && b)
+                out = b;
+        }
+    }
+    cache[src] = out;
+    return out;
 }
 
 // --------------------------------------------------------------- Surface ---
@@ -342,7 +404,7 @@ void Surface::Circle(float cx, float cy, float r, D2D1_COLOR_F c, bool fill, flo
 }
 // Draw an image. Linear filtering alone aliases badly when shrinking a large
 // icon 2-3x (jagged, "rough" edges), so the source is first downscaled with
-// WIC's high-quality Fant filter to just above the on-screen pixel size, rounded
+// WIC's high-quality cubic filter to just above the on-screen pixel size, rounded
 // up to a 16px bucket (so magnification reuses a few cached sizes instead of
 // one per frame). Linear then only covers the last <=16px step, which is clean.
 void Surface::Bitmap(IWICBitmapSource *src, D2D1_RECT_F r, float opacity) {
@@ -354,7 +416,14 @@ void Surface::Bitmap(IWICBitmapSource *src, D2D1_RECT_F r, float opacity) {
     if (sw && sh && dw > 0 && dh > 0) {
         float big = std::max(dw, dh);
         int b16 = ((int)ceilf(big) + 15) / 16 * 16;
-        if (b16 < (int)std::max(sw, sh)) bucket = b16;
+        int whole = (int)lroundf(big);
+        if (fabsf(big - whole) < 0.05f && whole < (int)std::max(sw, sh)) {
+            // at rest: scale straight to the exact pixel size and land on whole
+            // pixels, so the final linear step copies 1:1 and adds no blur
+            bucket = whole;
+            float l = roundf(r.left * scale) / scale, t = roundf(r.top * scale) / scale;
+            r = D2D1::RectF(l, t, l + (r.right - r.left), t + (r.bottom - r.top));
+        } else if (b16 < (int)std::max(sw, sh)) bucket = b16;
     }
     auto key = std::make_pair(src, bucket);
     ID2D1Bitmap *b = nullptr;
@@ -366,7 +435,7 @@ void Surface::Bitmap(IWICBitmapSource *src, D2D1_RECT_F r, float opacity) {
             UINT tw = std::max(1u, (UINT)(sw * f + 0.5f)), th = std::max(1u, (UINT)(sh * f + 0.5f));
             IWICBitmapScaler *sc = nullptr;
             if (SUCCEEDED(g_wic->CreateBitmapScaler(&sc)) &&
-                SUCCEEDED(sc->Initialize(src, tw, th, WICBitmapInterpolationModeFant)))
+                SUCCEEDED(sc->Initialize(src, tw, th, (WICBitmapInterpolationMode)4 /* HighQualityCubic */)))
                 rt->CreateBitmapFromWicBitmap(sc, nullptr, &b);
             SafeRelease(sc);
         }

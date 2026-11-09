@@ -24,6 +24,7 @@ struct MissionControl : Surface {
     void OnKey(UINT vk) override { if (vk == VK_ESCAPE) Close(); }
     void OnActivate(bool a) override { if (!a) Close(); }
     void Close();
+    bool closing = false;   // hiding us re-enters Close via OnActivate
     void UpdateThumbs();
 };
 static MissionControl *g_mc = nullptr;
@@ -138,6 +139,8 @@ void CALLBACK MCAnim(HWND, UINT, UINT_PTR id, DWORD) {
 }
 
 void MissionControl::Close() {
+    if (closing) return;
+    closing = true;
     for (auto &t : tiles) if (t.thumb) DwmUnregisterThumbnail(t.thumb);
     tiles.clear();
     if (anim) { KillTimer(nullptr, anim); anim = 0; }

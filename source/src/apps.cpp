@@ -28,6 +28,20 @@ std::wstring WindowAumid(HWND h) {
         PropVariantClear(&pv);
         ps->Release();
     }
+    if (r.empty()) {
+        // packaged apps often carry their app ID on the process, not the window
+        typedef LONG (WINAPI *GetAumidFn)(HANDLE, UINT32 *, PWSTR);
+        static GetAumidFn getAumid = (GetAumidFn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetApplicationUserModelId");
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        HANDLE p = getAumid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+        if (p) {
+            wchar_t buf[256];
+            UINT32 n = 256;
+            if (getAumid(p, &n, buf) == ERROR_SUCCESS) r = Lower(buf);
+            CloseHandle(p);
+        }
+    }
     return r;
 }
 
@@ -105,9 +119,7 @@ std::wstring AppNameFor(HWND h) {
     HWND real = RealAppWindow(h);
     std::wstring aumid = WindowAumid(real);
     std::wstring exe = WindowExe(h);
-    for (auto &a : AllApps())
-        if ((!aumid.empty() && a.aumid == aumid) || (!a.exe.empty() && a.exe == exe))
-            return a.name;
+    if (const AppEntry *a = FindAppForWindow(aumid, exe)) return a->name;
     // fall back to the product name in the exe's version info
     DWORD pid;
     WindowExe(h, &pid);
@@ -141,6 +153,7 @@ std::wstring AppNameFor(HWND h) {
 static std::vector<AppEntry> g_apps;
 std::vector<AppEntry> &AllApps(bool refresh) {
     if (!g_apps.empty() && !refresh) return g_apps;
+    for (auto &a : g_apps) if (a.pidl) CoTaskMemFree(a.pidl);
     g_apps.clear();
     IShellItem *appsFolder = nullptr;
     // shell:AppsFolder enumerates desktop + Store apps that show in the app list
@@ -153,6 +166,9 @@ std::vector<AppEntry> &AllApps(bool refresh) {
             PWSTR name = nullptr, parse = nullptr;
             if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &name))) e.name = name;
             if (SUCCEEDED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parse))) e.id = parse;
+            // keep the item itself: its icon is exactly the shortcut icon the
+            // taskbar/Start show, and it launches without re-parsing the name
+            SHGetIDListFromObject(item, &e.pidl);
             CoTaskMemFree(name);
             CoTaskMemFree(parse);
             // classify: a filesystem path is a desktop app, otherwise an AUMID
@@ -164,10 +180,22 @@ std::vector<AppEntry> &AllApps(bool refresh) {
                 PWSTR aumid = nullptr;
                 if (SUCCEEDED(i2->GetString(PKEY_AppUserModel_ID, &aumid)) && aumid) e.aumid = Lower(aumid);
                 CoTaskMemFree(aumid);
+                // what the shortcut runs, so a window with no app ID can still be
+                // matched to its Start-menu item (VS Code's id isn't a path).
+                // explorer.exe is skipped: many shell entries point at it.
+                PWSTR target = nullptr;
+                static const PROPERTYKEY GG_PKEY_Link_TargetParsingPath =
+                    {{0xB9B4B3FC, 0x2B51, 0x4A42, {0xB5, 0xD8, 0x32, 0x41, 0x46, 0xAF, 0xCF, 0x25}}, 2};
+                if (SUCCEEDED(i2->GetString(GG_PKEY_Link_TargetParsingPath, &target)) && target) {
+                    std::wstring t = Lower(FileNameOf(target));
+                    if (t.size() > 4 && t.substr(t.size() - 4) == L".exe" && t != L"explorer.exe") e.exe = t;
+                }
+                CoTaskMemFree(target);
                 i2->Release();
             }
             if (e.id.size() > 3 && Lower(e.id).substr(e.id.size() - 4) == L".exe") e.exe = Lower(FileNameOf(e.id));
             if (!e.name.empty()) g_apps.push_back(e);
+            else if (e.pidl) CoTaskMemFree(e.pidl);
             item->Release();
         }
         en->Release();
@@ -181,7 +209,46 @@ const AppEntry *FindApp(const std::wstring &id) {
     return nullptr;
 }
 
+// The Start-menu item for a window. Every app ID is checked before any exe, or a
+// Chrome web app (its own ID, same chrome.exe) would be taken for Chrome itself.
+const AppEntry *FindAppForWindow(const std::wstring &aumid, const std::wstring &exe) {
+    auto &apps = AllApps();
+    if (!aumid.empty()) for (auto &a : apps) if (a.aumid == aumid) return &a;
+    if (!exe.empty()) for (auto &a : apps) if (a.exe == exe) return &a;
+    return nullptr;
+}
+
+// Older builds pinned running apps by bare exe name ("code.exe"), which matches no
+// Start-menu item. Resolve by the shortcut's target, then for packaged apps (no
+// target) by display name: snippingtool.exe -> "Snipping Tool".
+std::wstring CanonicalAppId(const std::wstring &id) {
+    auto &apps = AllApps();
+    std::wstring l = Lower(id);
+    if (FindApp(id) || l.size() <= 4 || l.substr(l.size() - 4) != L".exe" ||
+        l.find(L'\\') != std::wstring::npos || l == L"explorer.exe")
+        return id;
+    for (auto &a : apps) if (a.exe == l) return a.id;
+    std::wstring stem = l.substr(0, l.size() - 4);
+    for (auto &a : apps) {
+        std::wstring n = Lower(a.name);
+        n.erase(std::remove(n.begin(), n.end(), L' '), n.end());
+        if (n == stem) return a.id;
+    }
+    return id;
+}
+
 void LaunchApp(const std::wstring &id) {
+    // launch the Start-menu item directly when we have it (works for desktop,
+    // Store and web apps alike)
+    if (const AppEntry *a = FindApp(id)) {
+        if (a->pidl) {
+            SHELLEXECUTEINFOW sei = {sizeof(sei)};
+            sei.fMask = SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI;
+            sei.lpIDList = a->pidl;
+            sei.nShow = SW_SHOWNORMAL;
+            if (ShellExecuteExW(&sei)) return;
+        }
+    }
     IShellItem *item = nullptr;
     std::wstring parse = id;
     if (id.find(L":\\") == std::wstring::npos && id.find(L"AppsFolder") != 0 && id.find(L"\\") != std::wstring::npos)
@@ -263,25 +330,42 @@ IWICBitmapSource *IconForExe(const std::wstring &exe, const std::wstring &aumid,
 
 // the shell's icon for any parsing name (a file path, or shell:AppsFolder\<id>),
 // icon-only so it keeps its alpha instead of coming back as a white-matte thumbnail
-IWICBitmapSource *ShellItemIcon(const std::wstring &parse, int size) {
-    IShellItem *item = nullptr;
-    if (FAILED(SHCreateItemFromParsingName(parse.c_str(), nullptr, IID_PPV_ARGS(&item)))) return nullptr;
+static IWICBitmapSource *IconFromItem(IShellItem *item, int size) {
     IShellItemImageFactory *fac = nullptr;
     HBITMAP hb = nullptr;
     if (SUCCEEDED(item->QueryInterface(&fac))) {
-        SIZE s = {size, size};
-        fac->GetImage(s, (SIIGBF)(0x1 | 0x4) /* BIGGERSIZEOK | ICONONLY */, &hb);
+        // always the largest the shell has: everything downstream scales down from it
+        SIZE s = {std::max(size, 256), std::max(size, 256)};
+        fac->GetImage(s,(SIIGBF)(0x1 | 0x4) /* BIGGERSIZEOK | ICONONLY */, &hb);
         fac->Release();
     }
-    item->Release();
     IWICBitmapSource *src = WicFromHBitmap(hb);
     if (hb) DeleteObject(hb);
     return src;
 }
 
+IWICBitmapSource *ShellItemIcon(const std::wstring &parse, int size) {
+    IShellItem *item = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(parse.c_str(), nullptr, IID_PPV_ARGS(&item)))) return nullptr;
+    IWICBitmapSource *r = IconFromItem(item, size);
+    item->Release();
+    return r;
+}
+
 // the shell's own icon for an app id (desktop or Store). Bare app IDs (Store apps,
 // Chrome/Edge web apps) only resolve under shell:AppsFolder, so try that too.
 static IWICBitmapSource *ShellIcon(const std::wstring &id, int size) {
+    // best: the Start-menu item itself (its shortcut icon is what the taskbar shows)
+    if (const AppEntry *a = FindApp(id)) {
+        if (a->pidl) {
+            IShellItem *item = nullptr;
+            if (SUCCEEDED(SHCreateItemFromIDList(a->pidl, IID_PPV_ARGS(&item)))) {
+                IWICBitmapSource *b = IconFromItem(item, size);
+                item->Release();
+                if (b) return b;
+            }
+        }
+    }
     std::wstring parse = id;
     if (id.find(L":\\") == std::wstring::npos && id.find(L"\\") != std::wstring::npos && id.find(L"AppsFolder") != 0)
         parse = L"shell:AppsFolder\\" + id;
@@ -293,17 +377,21 @@ static IWICBitmapSource *ShellIcon(const std::wstring &id, int size) {
 // An app's icon. Original style (default) = the app's own icon from the shell,
 // exactly what the taskbar shows; macOS style = the bundled replacement set when
 // one exists. Each falls back to the other so nothing ends up blank.
-IWICBitmapSource *AppIcon(const std::wstring &id, int size) {
-    std::wstring ck = (g_set.iconStyle ? L"t:" : L"o:") + id;
+IWICBitmapSource *AppIcon(const std::wstring &id, int size, bool bundledFallback) {
+    std::wstring ck = (g_set.iconStyle ? L"t:" : bundledFallback ? L"o:" : L"n:") + id;
     auto it = g_iconCache.find(ck);
     if (it != g_iconCache.end()) return it->second;
     const AppEntry *a = FindApp(id);
     std::wstring exe = a ? a->exe : (id.size() > 4 && Lower(id).substr(id.size() - 4) == L".exe" ? Lower(FileNameOf(id)) : L"");
     std::wstring aumid = a ? a->aumid : L"";
     IWICBitmapSource *b = nullptr;
-    if (g_set.iconStyle) b = IconForExe(exe, aumid, size);
+    // File Explorer keeps its Finder icon in every style
+    std::wstring lid = Lower(id);
+    bool finder = exe == L"explorer.exe" || aumid == L"microsoft.windows.explorer" ||
+                  lid == L"microsoft.windows.explorer" || (lid.size() >= 12 && lid.substr(lid.size() - 12) == L"explorer.exe");
+    if (g_set.iconStyle || finder) b = IconForExe(finder ? L"explorer.exe" : exe, aumid, size);
     if (!b) b = ShellIcon(id, size);
-    if (!b && !g_set.iconStyle) b = IconForExe(exe, aumid, size);
+    if (!b && !g_set.iconStyle && bundledFallback) b = IconForExe(exe, aumid, size);
     g_iconCache[ck] = b;
     return b;
 }
