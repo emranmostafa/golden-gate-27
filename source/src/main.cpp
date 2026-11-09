@@ -91,7 +91,7 @@ static void UnregisterHotkeys() {
 
 void CALLBACK TickTimer(HWND, UINT, UINT_PTR, DWORD) {
     ThemeApply(false);          // follow the time of day in Auto mode
-    ShakeAndCornersTick();
+    HotCornersTick();
     TaskbarKeepHidden();
     DockPeriodicRefresh();   // catch apps opened/closed without a foreground change
 }
@@ -100,6 +100,11 @@ void CALLBACK TickTimer(HWND, UINT, UINT_PTR, DWORD) {
 // periodic fault doesn't take Golden Gate down for good. crash.log lives in
 // %APPDATA%\GoldenGate and gives the offset to pinpoint the fault.
 static ULONGLONG g_launchTick = 0;
+static HANDLE g_mtx = nullptr;   // single-instance lock
+
+// our main window is message-only (HWND_MESSAGE), which plain FindWindow can't see
+static HWND FindRunningMain() { return FindWindowExW(HWND_MESSAGE, nullptr, L"GoldenGateMain", nullptr); }
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep) {
     void *addr = ep ? ep->ExceptionRecord->ExceptionAddress : nullptr;
     HMODULE mod = nullptr;
@@ -125,11 +130,17 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep) {
         CloseHandle(fh);
     }
     if (GetTickCount64() - g_launchTick > 8000) {   // relaunch, unless it crashed at startup
+        // drop the single-instance lock first, or the new copy sees "already
+        // running" and quits; it also waits for the lock (--relaunched) to be safe
+        if (g_mtx) { ReleaseMutex(g_mtx); CloseHandle(g_mtx); g_mtx = nullptr; }
         wchar_t self[MAX_PATH];
         GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::wstring cl = L"\"" + std::wstring(self) + L"\" --relaunched";
+        std::vector<wchar_t> buf(cl.begin(), cl.end());
+        buf.push_back(0);
         STARTUPINFOW si = {sizeof(si)};
         PROCESS_INFORMATION pi = {};
-        if (CreateProcessW(self, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        if (CreateProcessW(self, buf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         }
@@ -258,12 +269,31 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
 
     if (cmd && wcsstr(cmd, L"--restore")) return RunRestore();
 
-    // single instance
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"GoldenGate_SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND prev = FindWindowW(L"GoldenGateMain", nullptr);
-        if (prev) PostMessageW(prev, WM_APP + 71, 0, 0);
+    // --quit: shut a running copy down cleanly and wait for it (used by the
+    // installer before replacing files, so updates actually take effect)
+    if (cmd && wcsstr(cmd, L"--quit")) {
+        HWND prev = FindRunningMain();
+        if (prev) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(prev, &pid);
+            HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
+            PostMessageW(prev, WM_CLOSE, 0, 0);
+            if (p) { WaitForSingleObject(p, 6000); CloseHandle(p); }
+        }
         return 0;
+    }
+
+    // single instance
+    g_mtx = CreateMutexW(nullptr, TRUE, L"GoldenGate_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // after a crash the old copy may still be exiting: wait for its lock
+        bool relaunched = cmd && wcsstr(cmd, L"--relaunched");
+        DWORD w = relaunched ? WaitForSingleObject(g_mtx, 10000) : WAIT_TIMEOUT;
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+            HWND prev = FindRunningMain();   // a second launch: open Settings in the running copy
+            if (prev) PostMessageW(prev, WM_APP + 71, 0, 0);
+            return 0;
+        }
     }
 
     g_launchTick = GetTickCount64();
@@ -295,6 +325,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     g_tapHook = SetWindowsHookExW(WH_KEYBOARD_LL, TapHook, inst, 0);
     g_tickTimer = SetTimer(g_main, 1, 1000, TickTimer);
     SetTimer(g_main, 2, 300, ReassertTimer);   // keep bar + Dock on top
+    // a shake reverses direction several times in half a second; the 1s tick can't see it
+    SetTimer(g_main, 3, 33, [](HWND, UINT, UINT_PTR, DWORD) { ShakeTimerTick(); });
     g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                ForegroundEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
@@ -320,8 +352,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     ClipboardStop();
     MenuBarStop();
     DockStop();
+    TaskbarRestore();   // quitting must never leave you with no taskbar and no Dock
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     CoUninitialize();
-    (void)mtx;
+    if (g_mtx) { ReleaseMutex(g_mtx); CloseHandle(g_mtx); }
     return 0;
 }

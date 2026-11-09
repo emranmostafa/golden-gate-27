@@ -133,6 +133,16 @@ void ThemeApplyCursors() {
     RegSetString(HKEY_CURRENT_USER, K_CURSORS, nullptr, scheme);
     RegSetString(HKEY_CURRENT_USER, L"Control Panel\\Cursors\\Schemes", scheme.c_str(), list, REG_EXPAND_SZ);
     RegSetDword(HKEY_CURRENT_USER, K_CURSORS, L"Scheme Source", 1);
+    // remember the size Windows had, once, before we first change it (installs
+    // older than this setting already have a backup file without this value)
+    bool saved = false;
+    BGet(L"cursors", L"CursorBaseSize", &saved);
+    DWORD was = 32;
+    if (!saved) {
+        RegGetDword(HKEY_CURRENT_USER, K_CURSORS, L"CursorBaseSize", was);
+        BPut(L"cursors", L"CursorBaseSize", std::to_wstring(was));
+    }
+    RegSetDword(HKEY_CURRENT_USER, K_CURSORS, L"CursorBaseSize", (DWORD)g_set.cursorSize);
     SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
 }
 
@@ -185,6 +195,8 @@ void ThemeRestoreAll() {
         if (f && v != L"(empty)") RegSetString(HKEY_CURRENT_USER, K_CURSORS, c.reg, v, REG_EXPAND_SZ);
         else RegSetString(HKEY_CURRENT_USER, K_CURSORS, c.reg, L"", REG_EXPAND_SZ);
     }
+    v = BGet(L"cursors", L"CursorBaseSize", &f);
+    RegSetDword(HKEY_CURRENT_USER, K_CURSORS, L"CursorBaseSize", f ? (DWORD)_wtoi(v.c_str()) : 32);
     std::wstring scheme = L"Golden Gate (" + g_set.cursor + L")";
     RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Control Panel\\Cursors\\Schemes", scheme.c_str());
     SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);

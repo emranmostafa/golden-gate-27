@@ -170,11 +170,11 @@ static void ShakeTick() {
     POINT p; GetCursorPos(&p);
     int dx = p.x - last.x;
     last = p;
-    if (abs(dx) < 6) return;
+    if (abs(dx) < 20) return;   // per 33ms sample: only quick moves, not normal pointing
     int dir = dx > 0 ? 1 : -1;
     DWORD now = GetTickCount();
     if (dir != lastDir && lastDir != 0) {
-        if (now - windowStart > 600) { reversals = 0; windowStart = now; }
+        if (now - windowStart > 800) { reversals = 0; windowStart = now; }
         reversals++;
         if (reversals >= 4) {
             reversals = 0;
@@ -187,7 +187,7 @@ static void ShakeTick() {
 
 // ============================================================ hot corners ==
 static DWORD g_cornerSince = 0;
-static void HotCornersTick() {
+void HotCornersTick() {
     if (!g_set.hotCorner) return;
     POINT p; GetCursorPos(&p);
     HMONITOR mon = MonitorFromPoint(p, MONITOR_DEFAULTTOPRIMARY);
@@ -205,7 +205,6 @@ static void HotCornersTick() {
     }
 }
 
-void ShakeAndCornersTick() {
+void ShakeTimerTick() {
     if (g_set.shakeFind) ShakeTick();
-    HotCornersTick();
 }

@@ -19,6 +19,7 @@ struct Launchpad : Surface {
     void OnActivate(bool a) override { if (!a) Close(); }
     LRESULT OnMessage(UINT m, WPARAM wp, LPARAM lp, bool &handled) override;
     void Close();
+    bool closing = false;   // hiding us re-enters Close via OnActivate
 };
 static Launchpad *g_lp = nullptr;
 
@@ -117,6 +118,8 @@ void CALLBACK LPAnim(HWND, UINT, UINT_PTR id, DWORD) {
 }
 
 void Launchpad::Close() {
+    if (closing) return;
+    closing = true;
     if (anim) { KillTimer(nullptr, anim); anim = 0; }
     Show(false);
     Destroy();
@@ -143,6 +146,8 @@ struct Spotlight : Surface {
     std::wstring query;
     std::vector<Result> results;
     int sel = 0;
+    bool closing = false;
+    int openTop = 0;        // where the search box sits (screen px)
     void Search();
     void OnPaint() override;
     void OnKey(UINT vk) override;
@@ -190,7 +195,11 @@ void Spotlight::Resize() {
     RECT wr; GetWindowRect(hwnd, &wr);
     float sc = scale;
     int ph = (int)(h * sc);
-    SetWindowPos(hwnd, HWND_TOPMOST, wr.left, wr.top, wr.right - wr.left, ph, SWP_NOACTIVATE);
+    // the box stays put and results open below it, unless they'd run off the screen
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+    int top = std::max((int)mi.rcWork.top, std::min(openTop, (int)mi.rcWork.bottom - ph));
+    SetWindowPos(hwnd, HWND_TOPMOST, wr.left, top, wr.right - wr.left, ph, SWP_NOACTIVATE);
     Invalidate();
 }
 
@@ -249,7 +258,15 @@ void Spotlight::Run(int i) {
     else ShellOpen(a);
 }
 
-void Spotlight::Close() { Show(false); Destroy(); g_sl = nullptr; delete this; }
+// Close once. Hiding the focused window makes Windows send "deactivated" straight
+// back into OnActivate -> Close, which deleted Spotlight twice and crashed on Esc.
+void Spotlight::Close() {
+    if (closing) return;
+    closing = true;
+    Destroy();          // detaches us from the window first, so no re-entry
+    g_sl = nullptr;
+    delete this;
+}
 
 void SpotlightToggle() {
     if (g_sl) { g_sl->Close(); return; }
@@ -260,7 +277,8 @@ void SpotlightToggle() {
     float sc = DpiScaleForMonitor(mon);
     int w = (int)(620 * sc), h = (int)(56 * sc);
     int cx = (mi.rcWork.left + mi.rcWork.right) / 2;
-    int top = mi.rcWork.top + (int)((mi.rcWork.bottom - mi.rcWork.top) * 0.22f);
+    int top = (mi.rcWork.top + mi.rcWork.bottom - h) / 2;   // dead centre of the screen
+    g_sl->openTop = top;
     RECT r = {cx - w / 2, top, cx + w / 2, top + h};
     g_sl->Create(Surface::Glass, L"GoldenGateSpotlight", WS_EX_TOPMOST, r, nullptr, true);
     g_sl->Show(true, true);

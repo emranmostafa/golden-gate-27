@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.3 — Taskbar-accurate icons, crash fixes, updates that apply
+- **Icons chosen the way the taskbar does:** apps are matched to their Start-menu
+  item, and the icon comes straight from that item (its shortcut icon, which is
+  what a pinned taskbar button shows) instead of re-parsing its name, which failed
+  for desktop apps (`{GUID}\Folder\app.exe` names) and silently fell back to the
+  macOS set. Running apps also honour a window's own `RelaunchIconResource`, then
+  their app ID, the program's icon and the window icon. Finder and Trash keep
+  their icons. Apps also launch from the same Start-menu item.
+- **Crash fixed: confirm dialogs** (Empty Trash, Restart, Shut Down, Restore
+  Windows) deleted themselves twice on OK/Cancel. Empty Trash no longer asks twice.
+- **Updates now actually install:** the installer and uninstaller couldn't find the
+  running Golden Gate (its main window is message-only), so the old exe stayed in
+  use and updates didn't apply. They now run `GoldenGate.exe --quit`, then make
+  sure. A second launch also finds the running copy again (opens Settings).
+- **Crash auto-restart works:** the restarted copy used to see the crashed one's
+  single-instance lock and quit; the lock is now released and the new copy waits
+  for it.
+- **Quitting restores the Windows taskbar** instead of leaving neither taskbar nor
+  Dock.
+
 ## v2.2 — Original, crisp icons
 - **Original app icons by default:** the Dock, Launchpad and Spotlight now show
   each app's own icon from the shell (the same source the taskbar uses). The

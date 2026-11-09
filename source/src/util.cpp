@@ -169,6 +169,8 @@ void LoadSettings() {
     s.darkHour = IniInt(L"theme", L"darkHour", d.darkHour);
     s.accent = (unsigned)wcstoul(IniStr(L"theme", L"accent", L"3478F6").c_str(), nullptr, 16);
     s.cursor = IniStr(L"theme", L"cursor", d.cursor);
+    s.cursorSize = IniInt(L"theme", L"cursorSize", d.cursorSize);
+    if (s.cursorSize != 32 && s.cursorSize != 48 && s.cursorSize != 64 && s.cursorSize != 96) s.cursorSize = d.cursorSize;
     s.applyCursors = IniInt(L"theme", L"applyCursors", d.applyCursors);
     s.applyWallpaper = IniInt(L"theme", L"applyWallpaper", d.applyWallpaper);
     s.applyAccent = IniInt(L"theme", L"applyAccent", d.applyAccent);
@@ -202,7 +204,8 @@ void LoadSettings() {
     }
     s.missionControl = IniInt(L"features", L"missionControl", d.missionControl);
     s.hotCorner = IniInt(L"features", L"hotCorner", d.hotCorner);
-    s.switcher = IniInt(L"features", L"switcher", d.switcher);
+    // new key: the old "switcher" defaulted on, so existing installs return to Windows' Alt+Tab
+    s.switcher = IniInt(L"features", L"coverflowAltTab", d.switcher);
     s.spotlight = IniInt(L"features", L"spotlight", d.spotlight);
     s.launchpad = IniInt(L"features", L"launchpad", d.launchpad);
     s.clipboard = IniInt(L"features", L"clipboard", d.clipboard);
@@ -221,6 +224,7 @@ void SaveSettings() {
     IniPutInt(L"theme", L"darkHour", s.darkHour);
     IniPut(L"theme", L"accent", hex);
     IniPut(L"theme", L"cursor", s.cursor);
+    IniPutInt(L"theme", L"cursorSize", s.cursorSize);
     IniPutInt(L"theme", L"applyCursors", s.applyCursors);
     IniPutInt(L"theme", L"applyWallpaper", s.applyWallpaper);
     IniPutInt(L"theme", L"applyAccent", s.applyAccent);
@@ -248,7 +252,7 @@ void SaveSettings() {
     IniPut(L"dock", L"pinned", pins);
     IniPutInt(L"features", L"missionControl", s.missionControl);
     IniPutInt(L"features", L"hotCorner", s.hotCorner);
-    IniPutInt(L"features", L"switcher", s.switcher);
+    IniPutInt(L"features", L"coverflowAltTab", s.switcher);
     IniPutInt(L"features", L"spotlight", s.spotlight);
     IniPutInt(L"features", L"launchpad", s.launchpad);
     IniPutInt(L"features", L"clipboard", s.clipboard);
