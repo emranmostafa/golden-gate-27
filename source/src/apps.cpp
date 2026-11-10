@@ -193,7 +193,12 @@ std::vector<AppEntry> &AllApps(bool refresh) {
                 CoTaskMemFree(target);
                 i2->Release();
             }
-            if (e.id.size() > 3 && Lower(e.id).substr(e.id.size() - 4) == L".exe") { e.exe = Lower(FileNameOf(e.id)); e.target = e.id; }
+            // a path-style id may start with a known-folder GUID ({6D809377-...}\RustDesk\RustDesk.exe):
+            // only a real drive path can stand in for the shortcut's resolved target
+            if (e.id.size() > 3 && Lower(e.id).substr(e.id.size() - 4) == L".exe") {
+                e.exe = Lower(FileNameOf(e.id));
+                if (e.target.empty() && e.id.find(L":\\") != std::wstring::npos) e.target = e.id;
+            }
             if (!e.name.empty()) g_apps.push_back(e);
             else if (e.pidl) CoTaskMemFree(e.pidl);
             item->Release();
@@ -354,10 +359,10 @@ IWICBitmapSource *ShellItemIcon(const std::wstring &parse, int size) {
 
 // the shell's own icon for an app id (desktop or Store). Bare app IDs (Store apps,
 // Chrome/Edge web apps) only resolve under shell:AppsFolder, so try that too.
-// The shell only uses an exe's icon as "large" when it has a 256px image. With any
-// other big size (SessionX ships a single 240px icon) it draws the small icon on a
-// faint placeholder frame instead. In that case load the exe's own largest image.
-// Returns null when the shell's icon is already right (256px present, or no big art).
+// The shell only uses an exe's icon as "large" when it has a 256px image. Without
+// one (RustDesk ships only 48px, SessionX a single 240px) it draws the small icon
+// on a faint placeholder frame instead. In that case load the exe's own largest
+// image. Returns null when the shell's icon is already right (256px present).
 IWICBitmapSource *ExeNativeIcon(const std::wstring &exePath) {
     if (exePath.empty()) return nullptr;
     HMODULE m = LoadLibraryExW(exePath.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
@@ -377,7 +382,10 @@ IWICBitmapSource *ExeNativeIcon(const std::wstring &exePath) {
         return FALSE;
     }, (LONG_PTR)&biggest);
     FreeLibrary(m);
-    if (biggest >= 256 || biggest < 64) return nullptr;
+    // Any exe without a 256px image gets the framed placeholder from the shell
+    // (RustDesk ships only 48px, SessionX one 240px), so use its own largest
+    // image whatever the size; a 48px icon is about the Dock's own size anyway.
+    if (biggest >= 256 || biggest < 16) return nullptr;
     HICON big = nullptr;
     if (SHDefExtractIconW(exePath.c_str(), 0, 0, &big, nullptr, MAKELONG(biggest, 16)) != S_OK || !big) return nullptr;
     IWICBitmapSource *b = WicFromHIcon(big);
@@ -431,4 +439,68 @@ IWICBitmapSource *AppIcon(const std::wstring &id, int size, bool bundledFallback
     if (!b && !g_set.iconStyle && bundledFallback) b = IconForExe(exe, aumid, size);
     g_iconCache[ck] = b;
     return b;
+}
+
+// ------------------------------------------------------- icon diagnostic ---
+// GoldenGate.exe --test-icons=<file.png>: runs every Start-menu app through the
+// Dock's own icon path and saves one contact sheet (64px each, on a dark tile,
+// in Start-menu order) plus <file.png>.txt naming each tile, so a wrong icon (a
+// framed placeholder, the bundled set, nothing) is easy to spot for any app.
+int RunIconTest(const std::wstring &outPng) {
+    auto &apps = AllApps(true);
+    const int cell = 72, icon = 64, cols = 16;
+    int n = (int)apps.size(), rows = (n + cols - 1) / cols;
+    int W = cols * cell, H = std::max(1, rows) * cell;
+    std::vector<DWORD> sheet((size_t)W * H, 0xFF202020);
+    std::wstring index;
+    for (int i = 0; i < n; i++) {
+        int cx = (i % cols) * cell, cy = (i / cols) * cell;
+        for (int y = 2; y < cell - 2; y++)   // a slightly lighter tile behind each icon
+            for (int x = 2; x < cell - 2; x++) sheet[(size_t)(cy + y) * W + cx + x] = 0xFF2C2C2C;
+        IWICBitmapSource *b = AppIcon(apps[i].id, 128, false);   // as the Dock asks first
+        bool bundled = false;
+        if (!b) { b = AppIcon(apps[i].id, 128); bundled = b != nullptr; }   // its last resort
+        wchar_t line[64];
+        swprintf(line, 64, L"%3d  r%d c%d  %ls  ", i, i / cols, i % cols, b ? (bundled ? L"[bundled]" : L"") : L"[NONE]");
+        index += line + apps[i].name + L"  |  " + apps[i].id + L"\r\n";
+        if (!b) continue;
+        IWICBitmapSource *nb = NormalizeIcon(b);
+        IWICBitmapScaler *sc = nullptr;
+        if (FAILED(g_wic->CreateBitmapScaler(&sc))) continue;
+        std::vector<DWORD> px((size_t)icon * icon);
+        if (SUCCEEDED(sc->Initialize(nb, icon, icon, (WICBitmapInterpolationMode)4)) &&
+            SUCCEEDED(sc->CopyPixels(nullptr, icon * 4, (UINT)px.size() * 4, (BYTE *)px.data()))) {
+            int ox = cx + (cell - icon) / 2, oy = cy + (cell - icon) / 2;
+            for (int y = 0; y < icon; y++)
+                for (int x = 0; x < icon; x++) {   // premultiplied "over" the tile
+                    DWORD s = px[(size_t)y * icon + x], &d = sheet[(size_t)(oy + y) * W + ox + x];
+                    int a = s >> 24, inv = 255 - a;
+                    int r = ((s >> 16) & 255) + (((d >> 16) & 255) * inv) / 255;
+                    int g = ((s >> 8) & 255) + (((d >> 8) & 255) * inv) / 255;
+                    int bl = (s & 255) + ((d & 255) * inv) / 255;
+                    d = 0xFF000000 | (std::min(r, 255) << 16) | (std::min(g, 255) << 8) | std::min(bl, 255);
+                }
+        }
+        sc->Release();
+    }
+    // save the sheet as PNG
+    IWICStream *st = nullptr;
+    IWICBitmapEncoder *enc = nullptr;
+    IWICBitmapFrameEncode *fr = nullptr;
+    bool ok = SUCCEEDED(g_wic->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(outPng.c_str(), GENERIC_WRITE)) &&
+              SUCCEEDED(g_wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+              SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&fr, nullptr)) &&
+              SUCCEEDED(fr->Initialize(nullptr)) && SUCCEEDED(fr->SetSize(W, H));
+    if (ok) {
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+        ok = SUCCEEDED(fr->SetPixelFormat(&fmt)) &&
+             SUCCEEDED(fr->WritePixels(H, W * 4, (UINT)sheet.size() * 4, (BYTE *)sheet.data())) &&
+             SUCCEEDED(fr->Commit()) && SUCCEEDED(enc->Commit());
+    }
+    if (fr) fr->Release();
+    if (enc) enc->Release();
+    if (st) st->Release();
+    FILE *f = _wfopen((outPng + L".txt").c_str(), L"w, ccs=UTF-8");
+    if (f) { fputws(index.c_str(), f); fclose(f); }
+    return ok ? 0 : 1;
 }

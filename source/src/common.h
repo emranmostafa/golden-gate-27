@@ -81,6 +81,7 @@ struct Settings {
     // when a window overlaps it, like macOS/Dash-to-Dock), 2 always auto-hide
     int dockHide = 1;
     int dockSize = 52, dockMagnifySize = 84;
+    unsigned dockDotColor = 0;   // running dot: 0 automatic grey, 1 accent, else RGB
     int dlStyle = 0;            // Downloads stack: 0 fan, 1 grid, 2 automatic
     int iconStyle = 0;          // app icons: 0 original (as the taskbar shows), 1 macOS-style set
     std::vector<std::wstring> pinned;   // AppsFolder parsing names
@@ -253,6 +254,10 @@ struct MenuItem {
 void PopupMenu(std::vector<MenuItem> items, int x, int y, HWND owner = nullptr, float minWidth = 0);
 void ClosePopupMenus();
 bool PopupMenuOpen();
+// Dock right-click on a running app: live previews of its windows + its actions
+void ShowWindowPreviews(const std::vector<HWND> &windows, std::vector<MenuItem> actions, IWICBitmapSource *icon,
+                        int anchorX, int anchorBottom);
+bool WindowPreviewsOpen();
 
 // messages and hotkeys
 #define WM_GG_TRAY        (WM_APP + 1)

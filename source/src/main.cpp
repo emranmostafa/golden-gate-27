@@ -325,6 +325,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
         while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
         return 0;
     }
+    // diagnostic: every Start-menu app's Dock icon on one contact sheet (no UI)
+    if (cmd && wcsstr(cmd, L"--test-icons=")) {
+        extern int RunIconTest(const std::wstring &outPng);
+        if (!GfxInit()) return 1;
+        return RunIconTest(wcsstr(cmd, L"--test-icons=") + 13);
+    }
 
     // single instance
     g_mtx = CreateMutexW(nullptr, TRUE, L"GoldenGate_SingleInstance");
