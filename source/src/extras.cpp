@@ -161,28 +161,132 @@ static void ShowFindCursor() {
     });
 }
 
-// shake detection: watch direction reversals in a short window
-static void ShakeTick() {
-    static POINT last = {};
-    static int lastDir = 0;
-    static int reversals = 0;
-    static DWORD windowStart = 0;
-    POINT p; GetCursorPos(&p);
-    int dx = p.x - last.x;
-    last = p;
-    if (abs(dx) < 20) return;   // per 33ms sample: only quick moves, not normal pointing
-    int dir = dx > 0 ? 1 : -1;
-    DWORD now = GetTickCount();
-    if (dir != lastDir && lastDir != 0) {
-        if (now - windowStart > 800) { reversals = 0; windowStart = now; }
-        reversals++;
-        if (reversals >= 4) {
-            reversals = 0;
-            ShowFindCursor();
+// ============================================================ pointer grow ==
+// Shake to grow, ported from KDE Plasma's Shake Cursor effect (KWin
+// src/plugins/shakecursor, GPL-2.0-or-later), which is where the Linux behaviour
+// comes from: Bibata itself only supplies the artwork.
+//  - detection: within the last 1000ms, the pointer's path is more than 4x the
+//    diagonal of the box it covered, and that box is at least 100px across; no
+//    mouse button held
+//  - the first shake grows the pointer to 3x, each further shake adds 1x
+//  - every change animates over 200ms, InOutCubic
+//  - 2s after the last shake it shrinks back the same way
+//  - while enlarged the pointer is always the arrow (KWin draws Qt::ArrowCursor),
+//    so it grows over links and text too instead of staying a small hand/I-beam
+// Windows has no compositor hook for this, so the documented equivalent is used:
+// SetSystemCursor puts an enlarged Bibata arrow in every pointer role, and
+// SPI_SETCURSORS reloads the user's scheme from the registry to put it all back.
+// Bibata's .cur files carry 32-128px frames, so the big arrow is real artwork.
+static const DWORD kAllCursorRoles[] = {
+    32512 /*NORMAL*/, 32513 /*IBEAM*/, 32514 /*WAIT*/, 32515 /*CROSS*/, 32516 /*UP*/,
+    32642 /*SIZENWSE*/, 32643 /*SIZENESW*/, 32644 /*SIZEWE*/, 32645 /*SIZENS*/, 32646 /*SIZEALL*/,
+    32648 /*NO*/, 32649 /*HAND*/, 32650 /*APPSTARTING*/, 32651 /*HELP*/, 32671 /*PIN*/, 32672 /*PERSON*/,
+};
+static UINT_PTR g_growTimer = 0;
+static int g_growPx = 0;                       // arrow size currently set (0 = the normal scheme)
+static double g_mag = 1, g_magFrom = 1, g_magTarget = 1;
+static ULONGLONG g_animT0 = 0, g_lastShake = 0;
+
+static int CursorBasePx() { return (int)(g_set.cursorSize * GetDpiForSystem() / 96.0 + 0.5); }
+
+static void SetAllCursorsPx(int px) {
+    if (px == g_growPx) return;
+    std::wstring f = JoinPath(JoinPath(JoinPath(g_dir, L"cursors"), g_set.cursor), L"Pointer.cur");
+    HCURSOR src = (HCURSOR)LoadImageW(nullptr, f.c_str(), IMAGE_CURSOR, px, px, LR_LOADFROMFILE);
+    if (!src) return;
+    for (DWORD id : kAllCursorRoles) {
+        HCURSOR c = (HCURSOR)CopyImage(src, IMAGE_CURSOR, 0, 0, 0);
+        if (c && !SetSystemCursor(c, id)) DestroyCursor(c);   // on success Windows owns it
+    }
+    DestroyCursor(src);
+    g_growPx = px;
+}
+
+void PointerGrowStop() {
+    if (g_growTimer) { KillTimer(nullptr, g_growTimer); g_growTimer = 0; }
+    g_mag = g_magFrom = g_magTarget = 1;
+    if (g_growPx) { g_growPx = 0; SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0); }
+}
+
+static double InOutCubic(double p) { return p < 0.5 ? 4 * p * p * p : 1 - pow(-2 * p + 2, 3) / 2; }
+
+static void CALLBACK GrowTick(HWND, UINT, UINT_PTR, DWORD);
+static void AnimateTo(double m) {
+    if (m == g_magTarget) return;
+    g_magFrom = g_mag;
+    g_magTarget = m;
+    g_animT0 = GetTickCount64();
+    if (!g_growTimer) g_growTimer = SetTimer(nullptr, 0, 15, GrowTick);
+}
+
+static void CALLBACK GrowTick(HWND, UINT, UINT_PTR, DWORD) {
+    ULONGLONG now = GetTickCount64();
+    if (g_magTarget > 1 && now - g_lastShake >= 2000) AnimateTo(1);   // deflate timer
+    double p = std::min(1.0, (now - g_animT0) / 200.0);
+    g_mag = g_magFrom + (g_magTarget - g_magFrom) * InOutCubic(p);
+    if (p >= 1 && g_magTarget == 1) { PointerGrowStop(); return; }
+    int base = CursorBasePx();
+    SetAllCursorsPx(std::max(base, (int)lround(base * g_mag / 2) * 2));
+}
+
+// a shake was detected
+static void ShakeFound() {
+    if (!g_set.applyCursors) { ShowFindCursor(); return; }   // not our cursors: just the ring
+    double maxMag = 256.0 / CursorBasePx();                 // Windows' cursor size limit
+    AnimateTo(std::min(maxMag, g_magTarget == 1 ? 3.0 : g_magTarget + 1.0));
+    g_lastShake = GetTickCount64();
+}
+
+// KWin's ShakeDetector, fed by polling the pointer (Windows gives no global
+// motion events without a hook). Positions are in logical px like KWin's.
+struct ShakePt { double x, y; ULONGLONG t; };
+static std::vector<ShakePt> g_shakeHist;
+
+static bool SameSign(double a, double b) {
+    const double tolerance = 1;   // tiny moves count as either direction
+    return (a >= -tolerance && b >= -tolerance) || (a <= tolerance && b <= tolerance);
+}
+
+static bool ShakeDetect(double x, double y, ULONGLONG now) {
+    auto &h = g_shakeHist;
+    size_t k = 0;
+    while (k < h.size() && now - h[k].t >= 1000) k++;
+    h.erase(h.begin(), h.begin() + k);
+    if (h.size() >= 2) {
+        ShakePt &last = h[h.size() - 1];
+        const ShakePt &prev = h[h.size() - 2];
+        // still heading the same way: extend the last segment instead of adding one
+        if (SameSign(last.x - prev.x, x - last.x) && SameSign(last.y - prev.y, y - last.y)) {
+            last = {x, y, now};
+            return false;
         }
     }
-    lastDir = dir;
-    if (windowStart == 0) windowStart = now;
+    h.push_back({x, y, now});
+    double left = h[0].x, top = h[0].y, right = h[0].x, bottom = h[0].y, distance = 0;
+    for (size_t i = 1; i < h.size(); i++) {
+        double dx = h[i].x - h[i - 1].x, dy = h[i].y - h[i - 1].y;
+        distance += sqrt(dx * dx + dy * dy);
+        left = std::min(left, h[i].x); top = std::min(top, h[i].y);
+        right = std::max(right, h[i].x); bottom = std::max(bottom, h[i].y);
+    }
+    double bw = right - left, bh = bottom - top, diagonal = sqrt(bw * bw + bh * bh);
+    if (diagonal < 100) return false;
+    if (distance / diagonal > 4) { h.clear(); return true; }
+    return false;
+}
+
+static void ShakeTick() {
+    static POINT last = {LONG_MIN, LONG_MIN};
+    POINT p; GetCursorPos(&p);
+    if ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON)) & 0x8000) {
+        g_shakeHist.clear();   // dragging isn't shaking
+        last = p;
+        return;
+    }
+    if (p.x == last.x && p.y == last.y) return;   // only motion counts, as with KWin's events
+    last = p;
+    double sc = GetDpiForSystem() / 96.0;
+    if (ShakeDetect(p.x / sc, p.y / sc, GetTickCount64())) ShakeFound();
 }
 
 // ============================================================ hot corners ==

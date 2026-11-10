@@ -15,29 +15,51 @@ void SwitcherAction(int what, bool shift);
 void SwitcherStep(bool start);
 void ClipboardOnChange();
 
-// double-tap Ctrl -> Spotlight; Ctrl+Space -> Launchpad. A low-level keyboard
-// hook spots the double Ctrl without eating the key.
+// The Windows key, while Spotlight is on (Ctrl+Space -> Launchpad is a hotkey):
+//  - tapped on its own: Spotlight instead of the Start menu
+//  - Win+A: the Start menu (in place of Windows' Quick Settings shortcut)
+//  - every other Win shortcut (Win+E, Win+L, Win+Shift+S...) works as usual
+// A low-level keyboard hook (documented). Windows opens Start when the Win key is
+// released with nothing pressed in between, so:
+//  - for a tap, the release is held back and replayed after a harmless dummy key
+//    (0xFF, no meaning), which makes it a "shortcut" rather than a Start press
+//  - for Win+A the A is swallowed, so the release looks like a lone tap to
+//    Windows and opens Start the normal way
+// Our own injected keys (and every other program's) pass straight through.
 static HHOOK g_tapHook = nullptr;
-static DWORD g_lastCtrlUp = 0;
+static bool g_winCombo = false;   // another key went down while Win was held
+static bool g_winStart = false;   // Win+A: let the release open Start
 static LRESULT CALLBACK TapHook(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION) {
+    if (code == HC_ACTION && g_set.spotlight) {
         KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
-        if ((k->vkCode == VK_LCONTROL || k->vkCode == VK_RCONTROL)) {
-            if (wp == WM_KEYUP) {
-                DWORD now = GetTickCount();
-                bool otherDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_MENU) & 0x8000) ||
-                                 (GetAsyncKeyState(VK_LWIN) & 0x8000);
-                if (!otherDown && now - g_lastCtrlUp < 320 && g_set.spotlight) {
-                    g_lastCtrlUp = 0;
-                    PostMessageW(g_main, WM_APP + 70, 0, 0);
-                } else {
-                    g_lastCtrlUp = now;
+        if (!(k->flags & LLKHF_INJECTED)) {
+            bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN), up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+            bool isWin = (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN);
+            // async state isn't updated for this event yet: "held" means before it
+            bool winHeld = ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+            if (isWin && down) {
+                if (!(GetAsyncKeyState(k->vkCode) & 0x8000)) { g_winCombo = false; g_winStart = false; }   // not auto-repeat
+            } else if (isWin && up) {
+                bool otherWin = (GetAsyncKeyState(k->vkCode == VK_LWIN ? VK_RWIN : VK_LWIN) & 0x8000) != 0;
+                if (!g_winCombo && !g_winStart && !otherWin) {
+                    // a lone tap: replay the release after a dummy key so Start stays shut
+                    INPUT in[3] = {};
+                    in[0].type = in[1].type = in[2].type = INPUT_KEYBOARD;
+                    in[0].ki.wVk = 0xFF;
+                    in[1].ki.wVk = 0xFF; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    in[2].ki.wVk = (WORD)k->vkCode; in[2].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+                    SendInput(3, in, sizeof(INPUT));
+                    PostMessageW(g_main, WM_APP + 70, 0, 0);   // Spotlight
+                    return 1;
                 }
-            } else if (wp == WM_KEYDOWN) {
-                // Ctrl held + other key cancels the double-tap
+            } else if (winHeld) {
+                bool otherMod = (GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU)) & 0x8000;
+                if (k->vkCode == 'A' && !otherMod) {
+                    if (down) g_winStart = true;
+                    return 1;   // swallow A (down and up): Windows sees a lone Win press
+                }
+                if (down) g_winCombo = true;
             }
-        } else if (wp == WM_KEYDOWN) {
-            g_lastCtrlUp = 0;   // some other key: not a lone double-tap
         }
     }
     return CallNextHookEx(g_tapHook, code, wp, lp);
@@ -92,6 +114,7 @@ static void UnregisterHotkeys() {
 void CALLBACK TickTimer(HWND, UINT, UINT_PTR, DWORD) {
     ThemeApply(false);          // follow the time of day in Auto mode
     HotCornersTick();
+    MenuBarTrack();
     TaskbarKeepHidden();
     DockPeriodicRefresh();   // catch apps opened/closed without a foreground change
 }
@@ -143,8 +166,12 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep) {
         if (CreateProcessW(self, buf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
+            return EXCEPTION_EXECUTE_HANDLER;   // the new copy keeps the taskbar hidden
         }
     }
+    // nothing will take over (it crashed at startup, or the relaunch failed): give
+    // the Windows taskbar back so you're never left with no taskbar and no Dock
+    TaskbarRestore();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -183,6 +210,7 @@ static void CALLBACK ForegroundEvent(HWINEVENTHOOK, DWORD ev, HWND, LONG, LONG, 
     PostMessageW(g_main, WM_APP + 72, 0, 0);
 }
 static HWINEVENTHOOK g_fgHook = nullptr;
+static HWINEVENTHOOK g_moveHook = nullptr, g_minHook = nullptr;   // windows moved / minimised
 
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     if (m == g_msgTaskbarCreated) {
@@ -290,14 +318,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
         bool relaunched = cmd && wcsstr(cmd, L"--relaunched");
         DWORD w = relaunched ? WaitForSingleObject(g_mtx, 10000) : WAIT_TIMEOUT;
         if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
-            HWND prev = FindRunningMain();   // a second launch: open Settings in the running copy
-            if (prev) PostMessageW(prev, WM_APP + 71, 0, 0);
+            // a second launch opens Settings in the running copy, except the
+            // automatic one at sign-in (the logon task and the Run key fallback)
+            HWND prev = FindRunningMain();
+            if (prev && !(cmd && wcsstr(cmd, L"--autostart"))) PostMessageW(prev, WM_APP + 71, 0, 0);
             return 0;
         }
     }
 
     g_launchTick = GetTickCount64();
     SetUnhandledExceptionFilter(CrashFilter);
+    // hide the Windows taskbar before anything slow (reading the whole Start menu,
+    // wallpaper, building the UI), so at sign-in it's gone as soon as we start
+    TaskbarApply();
 
     if (!GfxInit()) { MessageBoxW(nullptr, L"Direct2D is required.", L"Golden Gate", MB_ICONERROR); return 1; }
     UpdatePalette();
@@ -318,6 +351,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     if (g_set.menubar) MenuBarStart();
     if (g_set.dock) DockStart();
     TaskbarApply();
+    AutostartSync();   // make sure the sign-in task exists (runs in the background)
     CaffeineSet(g_set.caffeine);
     ClipboardStart();
     SwitcherStep(true);
@@ -326,9 +360,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     g_tickTimer = SetTimer(g_main, 1, 1000, TickTimer);
     SetTimer(g_main, 2, 300, ReassertTimer);   // keep bar + Dock on top
     // a shake reverses direction several times in half a second; the 1s tick can't see it
-    SetTimer(g_main, 3, 33, [](HWND, UINT, UINT_PTR, DWORD) { ShakeTimerTick(); });
+    SetTimer(g_main, 3, 16, [](HWND, UINT, UINT_PTR, DWORD) { ShakeTimerTick(); });
     g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                ForegroundEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    // each monitor's panel names the top app there, which also changes when a
+    // window is dragged to another monitor or minimised without a focus change
+    g_moveHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, nullptr,
+                                 ForegroundEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_minHook = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr,
+                                ForegroundEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     // welcome: open settings on the very first run
     if (!FileExists(JoinPath(g_dataDir, L"settings.ini"))) {
@@ -346,9 +386,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     KillTimer(g_main, 1);
     KillTimer(g_main, 2);
     if (g_fgHook) UnhookWinEvent(g_fgHook);
+    if (g_moveHook) UnhookWinEvent(g_moveHook);
+    if (g_minHook) UnhookWinEvent(g_minHook);
     if (g_tapHook) UnhookWindowsHookEx(g_tapHook);
     SwitcherStep(false);
     UnregisterHotkeys();
+    PointerGrowStop();   // never leave a shake-enlarged arrow behind
     ClipboardStop();
     MenuBarStop();
     DockStop();

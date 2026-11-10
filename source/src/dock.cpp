@@ -31,6 +31,14 @@ struct Dock : Surface {
     RECT fanAnchor = {};
 
     float reveal = 1.f, revealTarget = 1.f;   // 1 shown, 0 hidden (slid down)
+    // the slide is time-based (eased over a fixed duration, ~60fps timer while it
+    // runs) so uneven timer ticks don't make it stutter
+    float revealFrom = 1.f;
+    double revealStart = 0, revealDur = 0;     // ms
+    UINT_PTR revealTimer = 0;
+    ULONGLONG hideSince = 0;                   // when "should hide" began (hide delay)
+    void SetRevealTarget(float t);
+    void RevealStep();
     RECT shownRect = {};                        // the dock's rect when fully shown
     float contentW = 0;                         // current (magnified) content width, logical px
     float winW = 0;                             // fixed window width (fully-magnified bound)
@@ -116,7 +124,10 @@ static IWICBitmapSource *RunningIcon(const std::wstring &key, HWND w) {
         if (p) {
             wchar_t path[MAX_PATH];
             DWORD n = MAX_PATH;
-            if (QueryFullProcessImageNameW(p, 0, path, &n)) icon = ShellItemIcon(path, 128);
+            if (QueryFullProcessImageNameW(p, 0, path, &n)) {
+                icon = ExeNativeIcon(path);   // big non-256 icons the shell would frame
+                if (!icon) icon = ShellItemIcon(path, 128);
+            }
             CloseHandle(p);
         }
     }
@@ -328,8 +339,14 @@ void Dock::PositionWindow() {
     if (shownRect.right == shownRect.left) return;
     int ph = shownRect.bottom - shownRect.top;
     int hiddenTop = shownRect.bottom + (int)(4 * scale);   // fully off the bottom
-    int top = (int)(hiddenTop + (shownRect.top - hiddenTop) * reveal);
+    int top = (int)lroundf(hiddenTop + (shownRect.top - hiddenTop) * reveal);
     RECT r = {shownRect.left, top, shownRect.right, top + ph};
+    // sliding only: move the window. A layered window keeps its pixels, so there's
+    // no need to redraw the whole Dock on every animation frame.
+    if (hwnd && r.right - r.left == width && r.bottom - r.top == height) {
+        SetWindowPos(hwnd, nullptr, r.left, r.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return;
+    }
     Move(r);
 }
 
@@ -372,6 +389,41 @@ bool Dock::CursorAtEdge() {
     return abs(p.x - cx) <= reach;
 }
 
+static double NowMs() {
+    static LARGE_INTEGER f = {};
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000.0 / f.QuadPart;
+}
+static void CALLBACK DockRevealTimer(HWND, UINT, UINT_PTR, DWORD) {
+    if (g_dock) g_dock->RevealStep();
+}
+
+void Dock::SetRevealTarget(float t) {
+    if (t == revealTarget && (revealTimer || reveal == t)) return;
+    revealFrom = reveal;
+    revealTarget = t;
+    revealStart = NowMs();
+    // full slide: 280ms up, 240ms down; a partial one takes its share
+    revealDur = std::max(60.0, (t > reveal ? 280.0 : 240.0) * fabsf(t - reveal));
+    if (!revealTimer) revealTimer = SetTimer(nullptr, 0, 10, DockRevealTimer);
+}
+
+void Dock::RevealStep() {
+    double p = std::min(1.0, (NowMs() - revealStart) / revealDur);
+    // ease-out cubic when appearing (fast start, gentle landing); ease-in-out
+    // when hiding so it doesn't snap away
+    double e = revealTarget > revealFrom ? 1 - pow(1 - p, 3)
+                                         : (p < 0.5 ? 4 * p * p * p : 1 - pow(-2 * p + 2, 3) / 2);
+    reveal = (float)(revealFrom + (revealTarget - revealFrom) * e);
+    if (p >= 1) {
+        reveal = revealTarget;
+        if (revealTimer) { KillTimer(nullptr, revealTimer); revealTimer = 0; }
+    }
+    PositionWindow();
+}
+
 void Dock::IntelliTick() {
     // keep the auto-hidden Windows taskbar from revealing over the Dock at the
     // bottom edge: re-hide fast (every 30ms tick), not just every 300ms
@@ -391,7 +443,20 @@ void Dock::IntelliTick() {
     }
     // a Dock menu or the Downloads stack is open: the pointer is on that, not the
     // Dock, but the Dock must stay up (like macOS) instead of sliding away
-    bool hovering = hot >= 0 || hoverX >= 0 || PopupMenuOpen() || DownloadsFanOpen();
+    // While the Dock is up, the whole area it occupies (its icons, the clear space
+    // above them and the gap down to the screen edge) keeps it up. Mouse messages
+    // alone can't do this: transparent pixels of a layered window don't get them,
+    // so the gap below the Dock used to count as "left" and it started hiding.
+    bool inZone = false;
+    if (revealTarget > 0.5f) {
+        POINT cp; GetCursorPos(&cp);
+        MONITORINFO mi = {sizeof(mi)};
+        GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+        int half = (int)(contentW * scale / 2) + (int)(10 * scale);
+        int cx = (shownRect.left + shownRect.right) / 2;
+        inZone = abs(cp.x - cx) <= half && cp.y >= shownRect.top && cp.y <= mi.rcMonitor.bottom;
+    }
+    bool hovering = inZone || hot >= 0 || hoverX >= 0 || PopupMenuOpen() || DownloadsFanOpen();
     bool show;
     if (CursorAtEdge() || hovering) show = true;
     else if (g_set.dockHide == 2) show = false;            // always auto-hide
@@ -403,12 +468,15 @@ void Dock::IntelliTick() {
         show = !lastOverlapped;
     }
     else show = true;                                       // never hide
-    revealTarget = show ? 1.f : 0.f;
-    if (fabsf(reveal - revealTarget) > 0.005f) {
-        reveal += (revealTarget - reveal) * 0.28f;
-        if (fabsf(reveal - revealTarget) <= 0.005f) reveal = revealTarget;
-        PositionWindow();
+    // appear at once, but wait a moment before hiding, so brushing past the edge
+    // or a quick overlap doesn't make it bob
+    ULONGLONG now = GetTickCount64();
+    if (show) hideSince = 0;
+    else if (revealTarget > 0.5f) {
+        if (!hideSince) hideSince = now;
+        if (now - hideSince < 450) show = true;
     }
+    SetRevealTarget(show ? 1.f : 0.f);
 }
 
 LRESULT Dock::OnMessage(UINT msg, WPARAM wp, LPARAM lp, bool &handled) {
@@ -621,6 +689,8 @@ float Dock::x_of(int i) {
 }
 
 void Dock::Downloads() {
+    extern bool DownloadsFanDismiss();
+    if (DownloadsFanDismiss()) return;   // second click closes the stack
     RECT a;
     GetWindowRect(hwnd, &a);
     RECT anchor = {a.left + (int)(x_of_downloads() * scale), a.top, a.left + (int)(x_of_downloads() * scale), a.top};
@@ -679,6 +749,7 @@ void DockStart() {
 void DockStop() {
     if (!g_dock) return;
     if (g_dock->intelliTimer) KillTimer(nullptr, g_dock->intelliTimer);
+    if (g_dock->revealTimer) KillTimer(nullptr, g_dock->revealTimer);
     ReserveDock(g_dock, false);
     g_dock->Destroy();
     delete g_dock;

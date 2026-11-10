@@ -22,8 +22,6 @@ BrandingText "${APP} ${VER}"
 !define MUI_ICON "..\assets\GoldenGate.ico"
 !define MUI_UNICON "..\assets\GoldenGate.ico"
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "Start Golden Gate now"
 !define MUI_FINISHPAGE_TEXT "Golden Gate is installed. It starts automatically when you sign in.$\r$\n$\r$\nOpen its settings any time from the circle icon at the top of the screen, or the tray icon."
 
 !insertmacro MUI_PAGE_WELCOME
@@ -35,20 +33,16 @@ BrandingText "${APP} ${VER}"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
-Function .onInit
-  ; Close a running copy before replacing files, or Windows keeps the old exe and
-  ; the update silently doesn't apply. Golden Gate's main window is message-only,
-  ; which FindWindow can't see, so ask the installed exe to quit the running one
-  ; cleanly, then make sure (older builds don't know --quit).
-  IfFileExists "$INSTDIR\${EXE}" 0 +2
-    ExecWait '"$INSTDIR\${EXE}" --quit'
-  nsExec::Exec 'taskkill /F /IM ${EXE}'
-  Pop $0
-  Sleep 700
-FunctionEnd
-
 Section "Golden Gate" SecMain
   SectionIn RO
+  ; Stop a running copy before replacing files (Windows keeps a running exe, so the
+  ; update wouldn't apply). Only now, once you've clicked Install, so the Dock and
+  ; panel stay up while you go through the pages. It's stopped, not asked to quit:
+  ; a normal quit gives the Windows taskbar back, and an update must not flash it.
+  ; The new version is started again below, and keeps the taskbar hidden.
+  nsExec::Exec 'taskkill /F /IM ${EXE}'
+  Pop $0
+  Sleep 500
   SetOutPath "$INSTDIR"
   File "..\dist\${EXE}"
   File "..\assets\GoldenGate.ico"
@@ -84,8 +78,9 @@ Section "Golden Gate" SecMain
   CreateShortcut "$SMPROGRAMS\Golden Gate\Golden Gate.lnk" "$INSTDIR\${EXE}" "" "$INSTDIR\GoldenGate.ico"
   CreateShortcut "$SMPROGRAMS\Golden Gate\Golden Gate Settings.lnk" "$INSTDIR\${EXE}" "" "$INSTDIR\GoldenGate.ico"
 
-  ; start at login (the app also maintains this key from its settings)
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GoldenGate" '"$INSTDIR\${EXE}"'
+  ; start at login. The app replaces this with a per-user sign-in task on first run
+  ; (it starts sooner than Run-key programs); this stays only as the fallback.
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GoldenGate" '"$INSTDIR\${EXE}" --autostart'
 
   ; Add/Remove Programs
   !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\GoldenGate"
@@ -102,6 +97,11 @@ Section "Golden Gate" SecMain
   WriteRegDWORD HKCU "${UNINST}" "EstimatedSize" "$0"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
+
+  ; start (again) straight away: an update replaces Golden Gate in a few seconds
+  ; rather than leaving you without it. --autostart: no Settings window on an
+  ; update (a first install still opens it to welcome you).
+  Exec '"$INSTDIR\${EXE}" --autostart'
 SectionEnd
 
 Section "Uninstall"
@@ -124,6 +124,8 @@ Section "Uninstall"
   Delete "$LOCALAPPDATA\Microsoft\Windows\Fonts\Inter-Bold.ttf"
 
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GoldenGate"
+  nsExec::Exec 'schtasks /delete /tn GoldenGate /f'   ; the sign-in task
+  Pop $0
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GoldenGate"
 
   Delete "$SMPROGRAMS\Golden Gate\*.lnk"

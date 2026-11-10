@@ -26,9 +26,18 @@ static unsigned PanelTint() {
 struct AppMenuSpec { std::wstring title; std::vector<MenuItem> items; };
 
 // standard menus for an app that doesn't give us its own; items drive the
-// focused window with the usual Windows shortcuts.
-static std::vector<AppMenuSpec> StandardMenus(const std::wstring &appName) {
-    auto key = [](std::initializer_list<WORD> k) { return [k]() { SendKeys(k); }; };
+// panel's window (the top app on that monitor) with the usual Windows shortcuts.
+// It may not be the focused one, so it's brought forward before the keys go.
+static std::vector<AppMenuSpec> StandardMenus(const std::wstring &appName, HWND target) {
+    // keys are copied into a vector: a captured initializer_list doesn't own its array
+    auto key = [target](std::initializer_list<WORD> k) {
+        std::vector<WORD> keys(k);
+        return [keys, target]() {
+            if (target && IsWindow(target) && GetForegroundWindow() != target) SetForegroundWindow(target);
+            if (keys.size() == 1) SendKeys({keys[0]});
+            else if (keys.size() == 2) SendKeys({keys[0], keys[1]});
+        };
+    };
     std::vector<AppMenuSpec> r;
     r.push_back({L"File", {
         {L"New Window", L"Ctrl+N", key({VK_CONTROL, 'N'})},
@@ -59,8 +68,8 @@ static std::vector<AppMenuSpec> StandardMenus(const std::wstring &appName) {
         MenuItem::Sep(),
         {L"Full Screen", L"F11", key({VK_F11})},
     }});
-    MenuItem minimize{L"Minimize", L"", []() { HWND h = GetForegroundWindow(); if (h) ShowWindow(h, SW_MINIMIZE); }};
-    MenuItem zoom{L"Zoom", L"", []() { HWND h = GetForegroundWindow(); if (h) ShowWindow(h, IsZoomed(h) ? SW_RESTORE : SW_MAXIMIZE); }};
+    MenuItem minimize{L"Minimize", L"", [target]() { if (target && IsWindow(target)) ShowWindow(target, SW_MINIMIZE); }};
+    MenuItem zoom{L"Zoom", L"", [target]() { if (target && IsWindow(target)) ShowWindow(target, IsZoomed(target) ? SW_RESTORE : SW_MAXIMIZE); }};
     r.push_back({L"Window", {minimize, zoom,
         MenuItem::Sep(),
         {L"Bring All to Front", L"", []() { MissionControlToggle(); }}}});
@@ -124,6 +133,13 @@ struct Bar : Surface {
     struct Zone { float x0, x1; int id; };
     std::vector<Zone> left, right;
     std::wstring appName = L"Finder";
+    HWND target = nullptr;     // the app window this panel names (top one on its monitor)
+    // dragging the panel moves that window, like dragging its title bar
+    HWND dragWin = nullptr;
+    bool dragging = false, wasZoomed = false;
+    POINT pressPt = {}, grab = {};
+    void DragWindowTo(POINT c);
+    void EndWindowDrag(POINT c);
     std::vector<AppMenuSpec> menus;
     bool menusAreReal = false;
     int hot = -1;          // index into a flattened zone list (left first, then right)
@@ -177,20 +193,43 @@ int Bar::BatteryPercent(bool &charging) {
     return -1;
 }
 
-void Bar::Rebuild() {
+// The app each monitor's panel names: the focused window if it's on that monitor,
+// otherwise the topmost app window there (EnumWindows walks top to bottom).
+static HWND TopAppWindowOn(HMONITOR mon) {
     HWND fg = GetForegroundWindow();
+    if (fg && IsAppWindow(fg) && !IsIconic(fg) && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == mon) return fg;
+    struct Scan { HMONITOR mon; HWND hit; } s = {mon, nullptr};
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto *s = (Scan *)lp;
+        if (IsIconic(h) || !IsAppWindow(h)) return TRUE;
+        if (MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != s->mon) return TRUE;
+        s->hit = h;
+        return FALSE;
+    }, (LPARAM)&s);
+    return s.hit;
+}
+
+void Bar::Rebuild() {
+    target = TopAppWindowOn(mon);
     menus.clear();
     menusAreReal = false;
-    if (fg && IsAppWindow(fg)) {
-        appName = AppNameFor(fg);
+    if (target) {
+        appName = AppNameFor(target);
         std::vector<AppMenuSpec> real;
-        if (RealMenus(fg, real)) { menus = real; menusAreReal = true; }
-        else menus = StandardMenus(appName);
+        if (RealMenus(target, real)) { menus = real; menusAreReal = true; }
+        else menus = StandardMenus(appName, target);
     } else {
         appName = L"Desktop";
-        menus = StandardMenus(appName);
+        menus = StandardMenus(appName, nullptr);
     }
     Invalidate();
+}
+
+// catch changes no event told us about (a window closed in the background, etc.):
+// rebuild only the panels whose top window actually changed
+void MenuBarTrack() {
+    for (auto *b : g_bars)
+        if (TopAppWindowOn(b->mon) != b->target) b->Rebuild();
 }
 
 void Bar::OnPaint() {
@@ -282,17 +321,82 @@ void Bar::OnPaint() {
     }
 }
 
-void Bar::OnMouse(UINT msg, float x, float y, WPARAM) {
+// Panel drag. Past a few pixels the panel's window follows the pointer (we hold
+// the mouse capture). A maximised window first restores to its normal size under
+// the pointer, as a title-bar drag does; dropping it back on any panel maximises
+// it on that monitor. A plain click just focuses the monitor's app.
+void Bar::DragWindowTo(POINT c) {
+    if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) { EndWindowDrag(c); return; }   // capture lost
+    if (!dragWin || !IsWindow(dragWin)) return;
+    if (!dragging) {
+        if (abs(c.x - pressPt.x) < 6 && abs(c.y - pressPt.y) < 6) return;
+        dragging = true;
+        RECT wr; GetWindowRect(dragWin, &wr);
+        wasZoomed = IsZoomed(dragWin) != FALSE;
+        if (wasZoomed) {
+            WINDOWPLACEMENT wp = {sizeof(wp)};
+            GetWindowPlacement(dragWin, &wp);
+            int nw = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+            int nh = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+            double fx = (double)(pressPt.x - wr.left) / std::max(1L, wr.right - wr.left);
+            ShowWindow(dragWin, SW_RESTORE);
+            grab = {(LONG)(fx * nw), (LONG)(16 * scale)};   // pointer stays on its title bar
+            SetWindowPos(dragWin, nullptr, c.x - grab.x, c.y - grab.y, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
+            return;
+        }
+        grab = {pressPt.x - wr.left, pressPt.y - wr.top};
+    }
+    SetWindowPos(dragWin, nullptr, c.x - grab.x, c.y - grab.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void Bar::EndWindowDrag(POINT c) {
+    HWND w = dragWin;
+    bool moved = dragging;
+    dragWin = nullptr;
+    dragging = false;
+    if (GetCapture() == hwnd) ReleaseCapture();
+    if (!w || !IsWindow(w)) return;
+    if (moved && wasZoomed) {
+        HMONITOR m = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = {sizeof(mi)};
+        GetMonitorInfo(m, &mi);
+        int panelPx = (int)(g_set.panelHeight * DpiScaleForMonitor(m)) + 2;
+        if (c.y < mi.rcMonitor.top + panelPx) {   // dropped back on a panel: maximise there
+            SetWindowPos(w, nullptr, mi.rcWork.left + 40, mi.rcWork.top + 40, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            ShowWindow(w, SW_MAXIMIZE);
+        }
+    }
+    SetForegroundWindow(w);
+}
+
+void Bar::OnMouse(UINT msg, float x, float y, WPARAM wp) {
+    if (dragWin) {   // a panel drag is in progress (mouse captured)
+        POINT c; GetCursorPos(&c);
+        if (msg == WM_MOUSEMOVE) DragWindowTo(c);
+        else if (msg == WM_LBUTTONUP) EndWindowDrag(c);
+        return;
+    }
     int z = -1;
     for (size_t i = 0; i < left.size(); i++) if (x >= left[i].x0 && x < left[i].x1) { z = (int)i; break; }
     int statusId = -1;
     if (z < 0) for (auto &r : right) if (x >= r.x0 && x < r.x1) { statusId = r.id; break; }
     bool onClock = x >= clockZoneX0 && x < clockZoneX1;
+    // scrolling over the volume icon changes the volume
+    if (msg == WM_MOUSEWHEEL) { if (statusId == 104) VolumeNudge(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1); return; }
     int newHot = z >= 0 ? z : (statusId >= 0 ? statusId : (onClock ? 200 : -1));
     if (newHot != hot) { hot = newHot; Invalidate(); }
+    // press on the app name or an empty part of the panel: start a window drag
+    bool emptyOrName = (z == 1 || z < 0) && statusId < 0 && !onClock;
+    if (msg == WM_LBUTTONDOWN && emptyOrName && target && IsWindow(target)) {
+        dragWin = target;
+        dragging = false;
+        GetCursorPos(&pressPt);
+        SetCapture(hwnd);
+        return;
+    }
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) {
         if (z == 0) OpenLogoMenu(left[0].x0);
-        else if (z == 1) { /* app name: bring windows of this app forward */ }
+        else if (z == 1) { /* app name with no window: nothing to do */ }
         else if (z >= 2 && z - 2 < (int)menus.size()) OpenAppMenu(z - 2, left[z].x0);
         else if (statusId >= 100) OpenStatusMenu(statusId, right_x0_for(statusId));
         else if (onClock) { RECT a = anchorAt((clockZoneX0 + clockZoneX1) / 2); extern void CalendarToggle(RECT); CalendarToggle(a); }
@@ -313,12 +417,14 @@ RECT Bar::anchorAt(float x) {
 
 void Bar::OpenLogoMenu(float x) {
     std::vector<MenuItem> m;
-    m.push_back({L"About This PC", L"", []() { ShowAbout(); }});
+    m.push_back({L"About This PC", L"", []() { ShellOpen(L"ms-settings:about"); }});   // System > About
     m.push_back(MenuItem::Sep());
     m.push_back({L"System Settings…", L"", []() { ShellOpen(L"ms-settings:"); }});
     m.push_back({L"Task Manager…", L"", []() { ShellOpen(L"taskmgr.exe"); }});
     m.push_back(MenuItem::Sep());
     m.push_back({L"Sleep", L"", []() { SetSuspendState(FALSE, FALSE, FALSE); }});
+    if (IsPwrHibernateAllowed())
+        m.push_back({L"Hibernate", L"", []() { SetSuspendState(TRUE, FALSE, FALSE); }});
     m.push_back({L"Restart…", L"", []() { ShowConfirm(L"Restart", L"Close all apps and restart this PC?", L"Restart",
         []() { ShellOpen(L"shutdown.exe", L"/r /t 0"); }); }});
     m.push_back({L"Shut Down…", L"", []() { ShowConfirm(L"Shut Down", L"Close all apps and shut down this PC?", L"Shut Down",
@@ -348,7 +454,7 @@ void Bar::OpenStatusMenu(int id, float x) {
         MenuBarRefresh();
         break;
     }
-    case 104: ShellOpen(L"ms-settings:sound"); break;
+    case 104: SendKeys({VK_LWIN, VK_CONTROL, 'V'}); break;   // Windows' audio panel (Quick Settings, sound output)
     case 105: ShellOpen(L"ms-availablenetworks:"); break;
     case 106: SpotlightToggle(); break;
     default: ControlCenterToggle(a); break;
