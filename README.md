@@ -11,8 +11,11 @@ programs.
 - No administrator rights for normal use.
 
 ## Install
-1. Run `GoldenGate-Setup.exe` (per-user install; SmartScreen may warn for an
-   unsigned build — choose **More info → Run anyway**).
+1. Download `GoldenGate-Setup.exe` from the
+   [latest release](https://github.com/emranmostafa/golden-gate-27/releases/latest)
+   and run it (per-user install; SmartScreen may warn for an unsigned build —
+   choose **More info → Run anyway**). To update, run the newer installer; your
+   settings are kept.
 2. Golden Gate starts and the Settings window opens on first run.
 3. It starts automatically at login (toggle in Settings → Advanced).
 

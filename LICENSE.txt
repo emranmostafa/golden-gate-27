@@ -1,7 +1,16 @@
 Golden Gate for Windows 11
 ==========================
 
-This product is made of original code plus the following open-source
+Golden Gate is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. The full license text is in LICENSE-GPL-3.0.txt.
+
+Source code: https://github.com/emranmostafa/golden-gate-27
+
+Golden Gate is made of original code plus the following open-source
 components, redistributed under their licenses. Golden Gate is not affiliated
 with, endorsed by, or sponsored by Apple Inc. "macOS" is a trademark of Apple
 Inc.; it is used here only to describe the visual style this software evokes.
@@ -22,13 +31,13 @@ Inc.; it is used here only to describe the visual style this software evokes.
    Copyright (c) The Inter Project Authors
    https://github.com/rsms/inter
    The font files in \fonts are redistributed unmodified. The OFL text is in
-   LICENSE-Inter.txt.
+   fonts\LICENSE-Inter.txt.
 
-The original Golden Gate code (the GoldenGate.exe application) is provided
-as-is, without warranty of any kind. The wallpapers are original artwork
-created for this product.
+4. KWin Shake Cursor effect (KDE Plasma)  -  GPL-2.0-or-later
+   Copyright (c) 2023 Vlad Zahorodnii
+   https://invent.kde.org/plasma/kwin (src/plugins/shakecursor)
+   The shake detection and pointer-grow behaviour in GoldenGate.exe
+   (source/src/extras.cpp) is ported from this code, and is used here under
+   the GPL version 3 as its "or later" terms allow.
 
-Because this product includes GPL-3.0 components that are redistributed with
-it, the corresponding source for those components is available at the URLs
-above. The Golden Gate application combines with them only at the asset level
-(cursor and icon files, not code).
+The wallpapers are original artwork created for this product.

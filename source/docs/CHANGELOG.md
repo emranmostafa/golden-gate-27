@@ -1,5 +1,38 @@
 # Changelog
 
+## v2.4 — Panel popups at the top, Windows-key Spotlight, a smoother Dock
+- **Real app icons in the Dock:** apps are matched to their Start-menu item by
+  app ID, then by what the shortcut runs, so VS Code, Snipping Tool and Store
+  apps show their own icons; the bundled set is only a last resort. Icons share
+  one margin, keep their alpha edges, and scale straight to their exact size.
+  Programs with a large non-256 px icon (e.g. SessionX) show it at full size.
+- **Dock auto-hide:** stays up while the pointer is anywhere over it (including
+  the gap below it), waits a moment before hiding, and slides on a timed 60 fps
+  ease. Clicking Downloads again closes the stack.
+- **Panel on every monitor:** each panel names the top app on its own monitor,
+  and its menus act on that app. Dragging the panel moves that app's window
+  (maximised windows restore; drop on a panel to maximise there).
+- **Panel popups at the top:** the volume and Wi-Fi icons open Windows' own
+  sound and Wi-Fi panels, placed just under the panel. Scrolling over the volume
+  icon changes the volume. The menu adds Hibernate; About This PC opens
+  Settings > About.
+- **Spotlight:** tap the Windows key to open it (Win+A opens Start; other Win
+  shortcuts are unchanged). It takes focus reliably, shows a typing cursor, sits
+  in the centre of the screen, and closes on a click elsewhere. Fixed a crash
+  when closing Spotlight, Launchpad or Mission Control with Esc.
+- **Pointer:** Style, Colour and Size (32-96 px) controls for the Bibata
+  cursors. Shake to grow, ported from KDE Plasma's Shake Cursor: keep shaking to
+  grow it more; it shrinks 2 s after you stop.
+- **Settings:** a standard Windows title bar; sliders with labelled stops that
+  the knob snaps to; descriptions wrap instead of overlapping.
+- **Startup and updates:** Golden Gate starts from a per-user sign-in task (no
+  admin) and hides the Windows taskbar first thing. Updating no longer brings
+  the taskbar back; the new version starts by itself. If Golden Gate can't
+  restart after a crash, the taskbar is restored.
+- **Alt+Tab** is Windows' own again by default (Cover-flow is in Settings).
+- **License:** Golden Gate is now GPL-3.0-or-later; the full GPL text ships with
+  it.
+
 ## v2.3 — Taskbar-accurate icons, crash fixes, updates that apply
 - **Icons chosen the way the taskbar does:** apps are matched to their Start-menu
   item, and the icon comes straight from that item (its shortcut icon, which is
