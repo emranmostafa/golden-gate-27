@@ -7,7 +7,7 @@ Unicode true
 !include "FileFunc.nsh"
 
 !define APP "Golden Gate"
-!define VER "2.4.0"
+!define VER "2.4.1"
 !define EXE "GoldenGate.exe"
 
 Name "${APP}"
