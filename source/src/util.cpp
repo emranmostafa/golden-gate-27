@@ -188,6 +188,7 @@ void LoadSettings() {
     s.dlStyle = std::max(0, std::min(2, IniInt(L"dock", L"downloads", d.dlStyle)));
     s.iconStyle = std::max(0, std::min(1, IniInt(L"dock", L"iconstyle", d.iconStyle)));
     s.dockMagnify = IniInt(L"dock", L"magnify", d.dockMagnify);
+    s.dockDotColor = (unsigned)IniInt(L"dock", L"dotColor", (int)d.dockDotColor);
     s.dockAutohide = IniInt(L"dock", L"autohide", d.dockAutohide);
     s.dockHide = IniInt(L"dock", L"hide", d.dockHide);
     s.dockReserve = IniInt(L"dock", L"reserve", d.dockReserve);
@@ -242,6 +243,7 @@ void SaveSettings() {
     IniPutInt(L"dock", L"downloads", s.dlStyle);
     IniPutInt(L"dock", L"iconstyle", s.iconStyle);
     IniPutInt(L"dock", L"magnify", s.dockMagnify);
+    IniPutInt(L"dock", L"dotColor", (int)s.dockDotColor);
     IniPutInt(L"dock", L"autohide", s.dockAutohide);
     IniPutInt(L"dock", L"hide", s.dockHide);
     IniPutInt(L"dock", L"reserve", s.dockReserve);

@@ -207,17 +207,21 @@ void Dock::Rebuild() {
             groupId[key] = id;
         }
     }
-    auto markRunning = [&](DockItem &it) {
-        for (auto &g : groups) {
-            std::wstring id = groupId[g.first];
-            if (id == it.id) { it.running = true; it.windows = g.second; }
-        }
+    // An app's windows can arrive in several groups that map to the same Dock item
+    // (SessionX gives each window its own app ID): merge them all, rather than the
+    // last group replacing the others and those windows going missing.
+    auto addWindows = [](DockItem &it, const std::vector<HWND> &ws) {
+        it.running = true;
+        for (HWND w : ws)
+            if (std::find(it.windows.begin(), it.windows.end(), w) == it.windows.end()) it.windows.push_back(w);
     };
-    for (auto &it : items) markRunning(it);
+    for (auto &it : items)
+        for (auto &g : groups)
+            if (groupId[g.first] == it.id) addWindows(it, g.second);
     for (auto &g : groups) {
         std::wstring id = groupId[g.first];
         bool have = false;
-        for (auto &it : items) if (it.id == id) { have = true; break; }
+        for (auto &it : items) if (it.id == id) { addWindows(it, g.second); have = true; break; }
         if (have) continue;
         DockItem it;
         it.id = id;
@@ -456,7 +460,7 @@ void Dock::IntelliTick() {
         int cx = (shownRect.left + shownRect.right) / 2;
         inZone = abs(cp.x - cx) <= half && cp.y >= shownRect.top && cp.y <= mi.rcMonitor.bottom;
     }
-    bool hovering = inZone || hot >= 0 || hoverX >= 0 || PopupMenuOpen() || DownloadsFanOpen();
+    bool hovering = inZone || hot >= 0 || hoverX >= 0 || PopupMenuOpen() || DownloadsFanOpen() || WindowPreviewsOpen();
     bool show;
     if (CursorAtEdge() || hovering) show = true;
     else if (g_set.dockHide == 2) show = false;            // always auto-hide
@@ -524,7 +528,8 @@ void Dock::OnPaint() {
         if (it.icon) Bitmap(NormalizeIcon(it.icon), ir);
         else { Fill(ir, g_pal.hover, s * 0.22f); Text(it.label.substr(0, 1), ir, g_pal.text, s * 0.4f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER); }
         if (it.running)
-            Circle(x + s / 2, h - 5, 2.2f, g_pal.textDim, true);
+            Circle(x + s / 2, h - 5, 2.2f, g_set.dockDotColor == 0 ? g_pal.textDim
+                                         : g_set.dockDotColor == 1 ? g_pal.accent : Rgb(g_set.dockDotColor), true);
         x += s + gap;
     }
     // name tag above the hovered item
@@ -640,30 +645,29 @@ void Dock::Activate(int i, bool rightClick) {
     }
     if (rightClick) {
         std::vector<MenuItem> m;
-        if (it.running) {
-            m.push_back({L"Show All Windows", L"", [this, i]() { for (HWND w : items[i].windows) ActivateWindow(w); }});
-            for (HWND w : it.windows) {
-                int n = GetWindowTextLengthW(w);
-                std::wstring t(n + 1, 0);
-                GetWindowTextW(w, &t[0], n + 1);
-                t.resize(n);
-                if (t.size() > 40) t = t.substr(0, 39) + L"…";
-                m.push_back({t, L"", [w]() { ActivateWindow(w); }});
-            }
-            m.push_back(MenuItem::Sep());
-            m.push_back({L"Quit", L"", [this, i]() { for (HWND w : items[i].windows) PostMessageW(w, WM_CLOSE, 0, 0); }});
-            m.push_back(MenuItem::Sep());
-        }
         std::wstring id = it.id;
         bool pinned = it.pinned;
-        m.push_back({pinned ? L"Remove from Dock" : L"Keep in Dock", L"", [id, pinned]() {
+        std::vector<HWND> wins = it.windows;   // copies: the Dock may rebuild meanwhile
+        MenuItem keep{pinned ? L"Remove from Dock" : L"Keep in Dock", L"", [id, pinned]() {
             if (pinned) g_set.pinned.erase(std::remove(g_set.pinned.begin(), g_set.pinned.end(), id), g_set.pinned.end());
             else g_set.pinned.push_back(id);
             SaveSettings();
             if (g_dock) g_dock->Rebuild();
-        }});
-        m.push_back({L"Open", L"", [id]() { LaunchApp(id); }});
+        }};
         RECT a; GetWindowRect(hwnd, &a);
+        if (it.running && !wins.empty()) {
+            // live previews of its windows above the icon, with the app's actions under them
+            m.push_back({L"New Window", L"", [id]() { LaunchApp(id); }});
+            m.push_back({L"Show All Windows", L"", [wins]() { for (HWND w : wins) ActivateWindow(w); }});
+            m.push_back(MenuItem::Sep());
+            m.push_back(keep);
+            m.push_back({L"Quit", L"", [wins]() { for (HWND w : wins) PostMessageW(w, WM_CLOSE, 0, 0); }});
+            float slabTop = H() - ((float)base + padY * 2);
+            ShowWindowPreviews(wins, m, it.icon, a.left + (int)(x_of(i) * scale), a.top + (int)((slabTop - 8) * scale));
+            return;
+        }
+        m.push_back(keep);
+        m.push_back({L"Open", L"", [id]() { LaunchApp(id); }});
         PopupMenu(m, a.left + (int)(x_of(i) * scale), a.top, hwnd);
         return;
     }
@@ -771,4 +775,206 @@ void DockPeriodicRefresh() {
 void DockReassert() {
     if (g_dock && g_dock->hwnd)
         SetWindowPos(g_dock->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+// ===================================================== window previews ======
+// Right-clicking a running app shows each of its windows as a live preview above
+// its icon, like Dash to Dock's preview menu (the dock MacTahoe pairs with on
+// Linux): click a preview to switch to that window, x to close it, and the app's
+// actions (New Window, Show All Windows, Keep in Dock, Quit) sit underneath.
+// The previews are DWM thumbnails (documented; Mission Control uses them too), so
+// they're live. A minimised window has no picture to show: it gets the app icon.
+struct PreviewWin {
+    HWND w;
+    std::wstring title;
+    HTHUMBNAIL thumb = nullptr;
+    D2D1_RECT_F cell = {}, closeBtn = {};
+};
+struct WindowPreviews : Surface {
+    std::vector<PreviewWin> wins;
+    std::vector<MenuItem> actions;
+    std::vector<D2D1_RECT_F> actionRects;
+    IWICBitmapSource *icon = nullptr;
+    int hot = -1;               // preview i; 1000+k action k; -2-i close button of i
+    bool closing = false;
+    int anchorX = 0, anchorBottom = 0;   // screen px: centre of the icon, top of the Dock
+    void Layout();
+    void Thumbs();
+    void Close();
+    void OnPaint() override;
+    void OnMouse(UINT msg, float x, float y, WPARAM) override;
+    void OnMouseLeave() override { if (hot != -1) { hot = -1; Invalidate(); } }
+    void OnActivate(bool a) override { if (!a) Close(); }
+    void OnKey(UINT vk) override { if (vk == VK_ESCAPE) Close(); }
+};
+static WindowPreviews *g_prev = nullptr;
+static ULONGLONG g_prevClosedAt = 0;
+static const float PV_CELL_W = 208, PV_THUMB_H = 120, PV_TITLE_H = 28, PV_PAD = 12, PV_GAP = 8, PV_ROW_H = 30;
+static const int PV_COLS = 4, PV_MAX = 8;
+
+bool WindowPreviewsOpen() { return g_prev != nullptr; }
+
+void WindowPreviews::Layout() {
+    int n = (int)wins.size(), cols = std::max(1, std::min(n, PV_COLS)), rows = (n + PV_COLS - 1) / PV_COLS;
+    float w = std::max(PV_PAD * 2 + cols * PV_CELL_W + (cols - 1) * PV_GAP, 240.f);
+    float y = PV_PAD;
+    for (int i = 0; i < n; i++) {
+        int r = i / PV_COLS, c = i % PV_COLS;
+        int inRow = std::min(PV_COLS, n - r * PV_COLS);   // centre a short last row
+        float rowW = inRow * PV_CELL_W + (inRow - 1) * PV_GAP, x0 = (w - rowW) / 2;
+        float x = x0 + c * (PV_CELL_W + PV_GAP), cy = y + r * (PV_THUMB_H + PV_TITLE_H + PV_GAP);
+        wins[i].cell = D2D1::RectF(x, cy, x + PV_CELL_W, cy + PV_THUMB_H + PV_TITLE_H);
+        wins[i].closeBtn = D2D1::RectF(x + PV_CELL_W - 26, cy + 6, x + PV_CELL_W - 6, cy + 26);
+    }
+    y += rows * (PV_THUMB_H + PV_TITLE_H) + std::max(0, rows - 1) * PV_GAP + (n ? 8 : 0);
+    actionRects.clear();
+    for (auto &a : actions) {
+        float rh = a.separator ? 9 : PV_ROW_H;
+        actionRects.push_back(D2D1::RectF(6, y, w - 6, y + rh));
+        y += rh;
+    }
+    float h = y + 6;
+    HMONITOR mon = MonitorFromPoint(POINT{anchorX, anchorBottom}, MONITOR_DEFAULTTONEAREST);
+    float sc = DpiScaleForMonitor(mon);
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfo(mon, &mi);
+    int pw = (int)(w * sc + 0.5f), ph = (int)(h * sc + 0.5f), m = (int)(8 * sc);
+    int x = std::max((int)mi.rcWork.left + m, std::min(anchorX - pw / 2, (int)mi.rcWork.right - pw - m));
+    int top = std::max((int)mi.rcWork.top + m, anchorBottom - ph);
+    RECT r = {x, top, x + pw, top + ph};
+    if (!hwnd) Create(Surface::Glass, L"GoldenGateWindowPreviews", WS_EX_TOPMOST, r, nullptr, true);
+    else Move(r);
+}
+
+// live thumbnails into each preview's picture area, keeping the window's shape
+void WindowPreviews::Thumbs() {
+    for (auto &p : wins) {
+        if (IsIconic(p.w)) {   // minimised: nothing to show, the app icon stands in
+            if (p.thumb) { DwmUnregisterThumbnail(p.thumb); p.thumb = nullptr; }
+            continue;
+        }
+        if (!p.thumb && FAILED(DwmRegisterThumbnail(hwnd, p.w, &p.thumb))) { p.thumb = nullptr; continue; }
+        SIZE src = {};
+        DwmQueryThumbnailSourceSize(p.thumb, &src);
+        float aw = PV_CELL_W - 16, ah = PV_THUMB_H - 12;
+        float f = (src.cx > 0 && src.cy > 0) ? std::min(aw / src.cx, ah / src.cy) : 1.f;
+        float tw = src.cx > 0 ? src.cx * f : aw, th = src.cy > 0 ? src.cy * f : ah;
+        float cx = (p.cell.left + p.cell.right) / 2, cy = p.cell.top + 6 + ah / 2;
+        DWM_THUMBNAIL_PROPERTIES tp = {};
+        tp.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+        tp.rcDestination = {(LONG)((cx - tw / 2) * scale), (LONG)((cy - th / 2) * scale),
+                            (LONG)((cx + tw / 2) * scale), (LONG)((cy + th / 2) * scale)};
+        tp.opacity = 255;
+        tp.fVisible = TRUE;
+        tp.fSourceClientAreaOnly = FALSE;
+        DwmUpdateThumbnailProperties(p.thumb, &tp);
+    }
+}
+
+void WindowPreviews::OnPaint() {
+    float w = W(), h = H();
+    Fill(D2D1::RectF(0, 0, w, h), g_pal.panel, 0);
+    Fill(D2D1::RectF(0, 0, w, h), WithAlpha(g_pal.panelStrong, 0.3f), 0);
+    for (int i = 0; i < (int)wins.size(); i++) {
+        auto &p = wins[i];
+        bool on = hot == i || hot == -2 - i;
+        if (on) Fill(p.cell, g_pal.hover, 10);
+        if (!p.thumb) {   // minimised (or no preview available): the app icon instead
+            float s = 48, cx = (p.cell.left + p.cell.right) / 2, cy = p.cell.top + 6 + (PV_THUMB_H - 12) / 2;
+            if (icon) Bitmap(NormalizeIcon(icon), D2D1::RectF(cx - s / 2, cy - s / 2 - 8, cx + s / 2, cy + s / 2 - 8));
+            if (IsIconic(p.w))
+                Text(L"Minimised", D2D1::RectF(p.cell.left, cy + 20, p.cell.right, cy + 38),
+                     g_pal.textDim, 11, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+        Text(p.title.empty() ? L"(untitled)" : p.title,
+             D2D1::RectF(p.cell.left + 8, p.cell.bottom - PV_TITLE_H, p.cell.right - 8, p.cell.bottom - 4),
+             g_pal.text, 12, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (on) {   // close button, top-right of the preview
+            D2D1_RECT_F c = p.closeBtn;
+            float cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2;
+            Circle(cx, cy, 10, hot == -2 - i ? Rgb(0xE81123) : WithAlpha(g_pal.panelStrong, 0.95f), true);
+            Text(L"", c, hot == -2 - i ? Rgb(0xFFFFFF) : g_pal.text, 9, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+        }
+    }
+    if (!wins.empty() && !actionRects.empty()) {
+        float ly = actionRects[0].top - 4;
+        Line(PV_PAD, ly, w - PV_PAD, ly, g_pal.separator);
+    }
+    for (int k = 0; k < (int)actions.size(); k++) {
+        D2D1_RECT_F r = actionRects[k];
+        if (actions[k].separator) { Line(PV_PAD, (r.top + r.bottom) / 2, w - PV_PAD, (r.top + r.bottom) / 2, g_pal.separator); continue; }
+        if (hot == 1000 + k) Fill(r, g_pal.accent, 7);
+        Text(actions[k].text, D2D1::RectF(r.left + 12, r.top, r.right - 12, r.bottom),
+             hot == 1000 + k ? g_pal.accentText : g_pal.text, 13);
+    }
+}
+
+void WindowPreviews::OnMouse(UINT msg, float x, float y, WPARAM) {
+    auto in = [&](D2D1_RECT_F r) { return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom; };
+    int nh = -1;
+    for (int i = 0; i < (int)wins.size() && nh == -1; i++) {
+        if (in(wins[i].closeBtn)) nh = -2 - i;
+        else if (in(wins[i].cell)) nh = i;
+    }
+    for (int k = 0; k < (int)actions.size() && nh == -1; k++)
+        if (!actions[k].separator && in(actionRects[k])) nh = 1000 + k;
+    if (nh != hot) { hot = nh; Invalidate(); }
+    if (msg != WM_LBUTTONUP || nh == -1) return;
+    if (nh >= 1000) {   // an action: run it after closing
+        auto act = actions[nh - 1000].action;
+        Close();
+        if (act) act();
+    } else if (nh >= 0) {   // a preview: switch to that window
+        HWND w = wins[nh].w;
+        Close();
+        ActivateWindow(w);
+    } else {   // close that window, keep the rest
+        int i = -2 - nh;
+        PostMessageW(wins[i].w, WM_CLOSE, 0, 0);
+        if (wins[i].thumb) DwmUnregisterThumbnail(wins[i].thumb);
+        wins.erase(wins.begin() + i);
+        hot = -1;
+        if (wins.empty()) { Close(); return; }
+        Layout();
+        Thumbs();
+        Invalidate();
+    }
+}
+
+void WindowPreviews::Close() {
+    if (closing) return;
+    closing = true;   // hiding re-enters through OnActivate
+    for (auto &p : wins) if (p.thumb) DwmUnregisterThumbnail(p.thumb);
+    wins.clear();
+    Destroy();
+    g_prev = nullptr;
+    g_prevClosedAt = GetTickCount64();
+    delete this;
+}
+
+void ShowWindowPreviews(const std::vector<HWND> &windows, std::vector<MenuItem> actions, IWICBitmapSource *icon,
+                        int anchorX, int anchorBottom) {
+    if (g_prev) { g_prev->Close(); return; }   // right-click again closes it
+    if (GetTickCount64() - g_prevClosedAt < 300) return;   // ...or this click just closed it
+    g_prev = new WindowPreviews();
+    for (HWND w : windows) {
+        if (!IsWindow(w) || (int)g_prev->wins.size() >= PV_MAX) continue;
+        PreviewWin p;
+        p.w = w;
+        int n = GetWindowTextLengthW(w);
+        std::wstring t(n + 1, 0);
+        GetWindowTextW(w, &t[0], n + 1);
+        t.resize(n);
+        p.title = t;
+        g_prev->wins.push_back(p);
+    }
+    g_prev->actions = std::move(actions);
+    g_prev->icon = icon;
+    g_prev->anchorX = anchorX;
+    g_prev->anchorBottom = anchorBottom;
+    g_prev->Layout();
+    g_prev->Show(true, true);
+    ForceForeground(g_prev->hwnd);
+    g_prev->Thumbs();
+    g_prev->Invalidate();
 }

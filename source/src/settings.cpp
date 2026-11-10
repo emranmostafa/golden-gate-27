@@ -21,7 +21,14 @@ struct Row {
     std::wstring unit;
     std::function<void(int)> preview;
     std::vector<int> stops;   // labelled detents: the knob sticks to the nearest one
+    // colour rows: the swatches offered (empty = the accent presets). Two special
+    // values: kColorAuto (drawn in the theme's grey) and kColorAccent (follows the
+    // accent colour; drawn with a white ring so it reads apart from the presets)
+    std::vector<unsigned> colors;
 };
+static const unsigned kColorAuto = 0, kColorAccent = 1;
+static const std::vector<unsigned> kAccentPresets = {0x3478F6, 0x30D158, 0xFF9F0A, 0xFF375F, 0xBF5AF2, 0x64D2FF, 0xFFD60A, 0x8E8E93};
+static const std::vector<unsigned> &SwatchesOf(const Row &r) { return r.colors.empty() ? kAccentPresets : r.colors; }
 
 struct Page { std::wstring name, glyph; std::vector<Row> rows; };
 
@@ -153,6 +160,9 @@ void SettingsWin::BuildPages() {
         []() { return g_set.dockSize; }, [](int v) { g_set.dockSize = v; g_set.dockMagnifySize = std::max(g_set.dockMagnifySize, v + 10); DockStop(); DockStart(); ApplyLive(); }, {}, 32, 84});
     dk.rows.back().unit = L" px";   // restarting the Dock per pixel lagged: applied on release
     dk.rows.back().stops = {32, 44, 52, 64, 76, 84};
+    dk.rows.push_back({C_COLOR, L"Running dot colour", L"The dot under open apps. First: automatic grey; second: your accent colour",
+        []() { return (int)g_set.dockDotColor; }, [](int v) { g_set.dockDotColor = (unsigned)v; DockRefresh(); ApplyLive(); }});
+    dk.rows.back().colors = {kColorAuto, kColorAccent, 0xFFFFFF, 0x3478F6, 0x30D158, 0xFF9F0A, 0xFF375F, 0xBF5AF2};
     dk.rows.push_back({C_SWITCH, L"Magnify on hover", L"",
         []() { return g_set.dockMagnify; }, [](int v) { g_set.dockMagnify = v; DockStop(); DockStart(); ApplyLive(); }});
     dk.rows.push_back({C_SEG, L"Hiding", L"Intellihide hides the Dock only when a window overlaps it; push the pointer to the bottom edge to show it",
@@ -242,7 +252,7 @@ void SettingsWin::OnPaint() {
         case C_SEG:    ctlW = 72.f * row.options.size(); break;
         case C_SLIDER: ctlW = 200 + 56; break;   // value label + track
         case C_CHOICE: ctlW = 180; break;
-        case C_COLOR:  ctlW = (24 + 8) * 8 - 8; break;
+        case C_COLOR:  ctlW = (24 + 8) * (float)SwatchesOf(row).size() - 8; break;
         default: break;
         }
         float textL = cx + 16, textR = ctlW > 0 ? ctlR - ctlW - 20 : ctlR;
@@ -306,12 +316,19 @@ void SettingsWin::OnPaint() {
             Text(L"", D2D1::RectF(sx, sy, sx + cwid - 8, sy + 28), g_pal.textDim, 11, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
             row.ctlRect = D2D1::RectF(sx, sy, sx + cwid, sy + 28);
         } else if (row.type == C_COLOR) {
-            static unsigned presets[] = {0x3478F6, 0x30D158, 0xFF9F0A, 0xFF375F, 0xBF5AF2, 0x64D2FF, 0xFFD60A, 0x8E8E93};
-            float sw = 24, gap = 8, totW = (sw + gap) * 8 - gap, sx = ctlR - totW, sy = y + (rh - 6 - sw) / 2;
-            for (int o = 0; o < 8; o++) {
-                float px = sx + o * (sw + gap);
-                Circle(px + sw / 2, sy + sw / 2, sw / 2, Rgb(presets[o]), true);
-                if ((g_set.accent & 0xFFFFFF) == presets[o]) Circle(px + sw / 2, sy + sw / 2, sw / 2 + 3, g_pal.text, false, 2);
+            const auto &sw8 = SwatchesOf(row);
+            int n = (int)sw8.size();
+            float sw = 24, gap = 8, totW = (sw + gap) * n - gap, sx = ctlR - totW, sy = y + (rh - 6 - sw) / 2;
+            unsigned cur = (unsigned)row.get() & 0xFFFFFF;
+            for (int o = 0; o < n; o++) {
+                float px = sx + o * (sw + gap), ccx = px + sw / 2, ccy = sy + sw / 2;
+                unsigned v = sw8[o];
+                D2D1_COLOR_F col = v == kColorAuto && !row.colors.empty() ? g_pal.textDim
+                                 : v == kColorAccent && !row.colors.empty() ? g_pal.accent : Rgb(v);
+                Circle(ccx, ccy, sw / 2, col, true);
+                if (v == 0xFFFFFF) Circle(ccx, ccy, sw / 2, g_pal.separator, false, 1);   // white on a light page
+                if (v == kColorAccent && !row.colors.empty()) Circle(ccx, ccy, sw / 2 - 4, Rgb(0xFFFFFF, 0.9f), false, 1.5f);
+                if (cur == (v & 0xFFFFFF)) Circle(ccx, ccy, sw / 2 + 3, g_pal.text, false, 2);
             }
             row.ctlRect = D2D1::RectF(sx, sy, sx + totW, sy + sw);
         } else if (row.type == C_BUTTON) {
@@ -394,10 +411,10 @@ void SettingsWin::OnMouse(UINT msg, float x, float y, WPARAM wp) {
             Invalidate(); return;
         }
         if (row.type == C_COLOR && up) {
-            static unsigned presets[] = {0x3478F6, 0x30D158, 0xFF9F0A, 0xFF375F, 0xBF5AF2, 0x64D2FF, 0xFFD60A, 0x8E8E93};
+            const auto &sw8 = SwatchesOf(row);
             float sw = 24, gap = 8;
             int o = (int)((x - c.left) / (sw + gap));
-            if (o >= 0 && o < 8) { row.set((int)presets[o]); Invalidate(); }
+            if (o >= 0 && o < (int)sw8.size()) { row.set((int)sw8[o]); Invalidate(); }
             return;
         }
         if (row.type == C_CHOICE && up) {
