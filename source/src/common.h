@@ -215,6 +215,7 @@ HWND RealAppWindow(HWND h);           // for ApplicationFrameHost (Store apps), 
 std::wstring AppNameFor(HWND h);
 void ActivateWindow(HWND h);
 void SendKeys(std::initializer_list<WORD> keys);
+void ForceForeground(HWND h);   // focus one of our windows even when Windows' focus lock would refuse
 
 // -------------------------------------------------------------- modules ---
 void MenuBarStart();   void MenuBarStop();   void MenuBarRefresh();   void MenuBarReassert();   void MenuBarRetint();
@@ -222,6 +223,9 @@ void DockStart();      void DockStop();      void DockRefresh();      void DockR
 void TaskbarKeepHidden();
 void ControlCenterToggle(RECT anchor);
 void VolumeNudge(int steps);              // +/- 2% per step
+void OpenWindowsFlyout(int which);       // 0 sound output, 1 Wi-Fi: Windows' own popup, under the panel
+void FlyoutWatch();                       // keep Windows' Quick Settings popup under the panel while it's open
+void FlyoutHooksStart(); void FlyoutHooksStop();   // place that popup the moment it's shown
 void MissionControlToggle();
 void SwitcherStep(bool start);
 void LaunchpadToggle();

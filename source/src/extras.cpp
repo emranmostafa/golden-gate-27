@@ -312,3 +312,129 @@ void HotCornersTick() {
 void ShakeTimerTick() {
     if (g_set.shakeFind) ShakeTick();
 }
+
+// ============================================= Windows flyouts at the top ==
+// The panel's volume and Wi-Fi icons open Windows' own Quick Settings pages
+// (sound output, Wi-Fi list). Windows draws those next to the taskbar: one tall,
+// transparent shell window (ShellHost, class ControlCenterWindow) down the right
+// edge, with the content at its bottom. Windows gives that window a region
+// (SetWindowRgn) covering exactly the visible content, so GetWindowRgnBox says
+// where the content is, and moving the window with SetWindowPos (documented; the
+// shell keeps working) puts the content's top edge just under the panel.
+//  - No flash at the bottom: Windows keeps that window (hidden) between uses, so
+//    before opening it we move it to where the content sat last time for the same
+//    page. It appears under the panel straight away. A WinEvent hook on it being
+//    shown/uncloaked corrects it the moment it appears, if the height changed.
+//  - While it's open the region is re-read ~60 times a second: the Wi-Fi list
+//    growing as it scans, or moving between pages, keeps the top edge put.
+//  - This applies however the popup was opened (our icons, Win+Ctrl+V...).
+static HWND g_fly = nullptr;
+static UINT_PTR g_flyTimer = 0;
+static ULONGLONG g_flyStart = 0, g_flyGoneSince = 0;
+static int g_flyWhich = -1;                 // page we opened (-1: opened some other way)
+static int g_flyBoxTop[2] = {-1, -1};       // content top within the window, last seen per page
+static int g_flyBoxTopAny = -1;             // ...and for whatever was shown last
+static HWINEVENTHOOK g_flyShowHook = nullptr, g_flyUncloakHook = nullptr;
+
+static void FlyoutStop() {
+    if (g_flyTimer) { KillTimer(nullptr, g_flyTimer); g_flyTimer = 0; }
+    g_fly = nullptr;
+    g_flyWhich = -1;
+}
+
+static bool FlyoutShowing(HWND h) {
+    if (!h || !IsWindow(h) || !IsWindowVisible(h)) return false;
+    BOOL cloaked = FALSE;
+    DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof(cloaked));
+    return !cloaked;
+}
+
+// the window y that puts content starting `boxTop` px into the window just under the panel
+static int FlyoutWindowY(HWND h, int boxTop) {
+    RECT wr;
+    GetWindowRect(h, &wr);
+    HMONITOR mon = MonitorFromRect(&wr, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfo(mon, &mi);
+    return mi.rcMonitor.top + (int)((g_set.panelHeight + 6) * DpiScaleForMonitor(mon)) - boxTop;
+}
+
+static void FlyoutMoveTo(HWND h, int y) {
+    RECT wr;
+    GetWindowRect(h, &wr);
+    if (abs(wr.top - y) > 1)
+        SetWindowPos(h, nullptr, wr.left, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// place by the region Windows gave the content; false if there isn't one yet
+static bool FlyoutPlace(HWND h) {
+    RECT box;   // the content, relative to the window
+    if (GetWindowRgnBox(h, &box) == ERROR || box.bottom - box.top < 40) return false;
+    if (g_flyWhich >= 0) g_flyBoxTop[g_flyWhich] = box.top;
+    g_flyBoxTopAny = box.top;
+    FlyoutMoveTo(h, FlyoutWindowY(h, box.top));
+    return true;
+}
+
+static void CALLBACK FlyoutTick(HWND, UINT, UINT_PTR, DWORD) {
+    ULONGLONG now = GetTickCount64();
+    if (!g_fly) {   // wait for it to open
+        HWND f = FindWindowW(L"ControlCenterWindow", nullptr);
+        if (FlyoutShowing(f)) { g_fly = f; g_flyGoneSince = 0; }
+        else if (now - g_flyStart > 5000) FlyoutStop();   // Windows can be slow to open it
+        if (!g_fly) return;
+    }
+    if (!FlyoutShowing(g_fly)) {   // closed (it's hidden/cloaked, not destroyed)
+        if (!g_flyGoneSince) g_flyGoneSince = now;
+        else if (now - g_flyGoneSince > 400) FlyoutStop();
+        return;
+    }
+    g_flyGoneSince = 0;
+    FlyoutPlace(g_fly);
+}
+
+// start keeping the Quick Settings popup under the panel while it's open
+void FlyoutWatch() {
+    g_flyStart = GetTickCount64();
+    if (!g_flyTimer) g_flyTimer = SetTimer(nullptr, 0, 15, FlyoutTick);
+}
+
+// the popup is being shown/uncloaked: place it right now, before it's seen
+static void CALLBACK FlyoutShownEvent(HWINEVENTHOOK, DWORD, HWND h, LONG idObject, LONG, DWORD, DWORD) {
+    if (!h || idObject != OBJID_WINDOW) return;
+    wchar_t cls[32] = {};
+    GetClassNameW(h, cls, 32);
+    if (wcscmp(cls, L"ControlCenterWindow")) return;
+    if (!FlyoutPlace(h)) {
+        int top = g_flyWhich >= 0 && g_flyBoxTop[g_flyWhich] >= 0 ? g_flyBoxTop[g_flyWhich] : g_flyBoxTopAny;
+        if (top >= 0) FlyoutMoveTo(h, FlyoutWindowY(h, top));
+    }
+    FlyoutWatch();
+}
+
+void FlyoutHooksStart() {
+    // only ShellHost's events are wanted, but its process id isn't known up front;
+    // the class check in the callback filters, and these events are infrequent
+    g_flyShowHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, FlyoutShownEvent, 0, 0,
+                                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_flyUncloakHook = SetWinEventHook(EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr, FlyoutShownEvent, 0, 0,
+                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+void FlyoutHooksStop() {
+    if (g_flyShowHook) { UnhookWinEvent(g_flyShowHook); g_flyShowHook = nullptr; }
+    if (g_flyUncloakHook) { UnhookWinEvent(g_flyUncloakHook); g_flyUncloakHook = nullptr; }
+    FlyoutStop();
+}
+
+// which: 0 sound output (Win+Ctrl+V), 1 Wi-Fi list
+void OpenWindowsFlyout(int which) {
+    g_flyWhich = which;
+    // move the hidden popup window to where this page's content sat last time, so
+    // it appears under the panel instead of sliding up from the bottom first
+    HWND f = FindWindowW(L"ControlCenterWindow", nullptr);
+    int top = g_flyBoxTop[which];
+    if (f && top >= 0 && !FlyoutShowing(f)) FlyoutMoveTo(f, FlyoutWindowY(f, top));
+    if (which == 0) SendKeys({VK_LWIN, VK_CONTROL, 'V'});
+    else ShellOpen(L"ms-availablenetworks:");
+    FlyoutWatch();
+}

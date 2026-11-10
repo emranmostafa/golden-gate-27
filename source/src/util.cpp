@@ -349,3 +349,21 @@ void AutostartSync() {
     if (t) CloseHandle(t);
     else ApplyAutostart(applied != 0);
 }
+
+// Bring one of our windows to the front with keyboard focus. Windows only lets a
+// process take the foreground right after the user interacted with it; after a
+// Windows-key tap (seen by our hook, but delivered to another app) or while a
+// shell popup holds focus, a plain SetForegroundWindow is refused and the window
+// opens without focus: no typing, and no "lost focus" to close it. A harmless
+// injected key (0xFF, no meaning) counts as input to us and lifts that lock.
+void ForceForeground(HWND h) {
+    if (!h) return;
+    if (SetForegroundWindow(h) && GetForegroundWindow() == h) return;
+    INPUT in[2] = {};
+    in[0].type = in[1].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = in[1].ki.wVk = 0xFF;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+    SetForegroundWindow(h);
+    SetFocus(h);
+}

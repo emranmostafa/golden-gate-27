@@ -204,7 +204,12 @@ void CALLBACK ReassertTimer(HWND, UINT, UINT_PTR, DWORD) {
     DockReassert();
 }
 
-static void CALLBACK ForegroundEvent(HWINEVENTHOOK, DWORD ev, HWND, LONG, LONG, DWORD, DWORD) {
+static void CALLBACK ForegroundEvent(HWINEVENTHOOK, DWORD ev, HWND hwnd, LONG, LONG, DWORD, DWORD) {
+    if (hwnd && ev == EVENT_SYSTEM_FOREGROUND) {   // Windows' Quick Settings popup: keep it under the panel
+        wchar_t cls[32] = {};
+        GetClassNameW(hwnd, cls, 32);
+        if (!wcscmp(cls, L"ControlCenterWindow")) FlyoutWatch();
+    }
     // the focused app changed: update the menu bar, the Dock's running marks,
     // and keep our surfaces on top
     PostMessageW(g_main, WM_APP + 72, 0, 0);
@@ -311,6 +316,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
         return 0;
     }
 
+    // diagnostic: open the sound popup under the panel exactly as the volume icon does,
+    // then exit after a few seconds. Runs beside a running copy (no UI, no lock).
+    if (cmd && wcsstr(cmd, L"--test-flyout")) {
+        OpenWindowsFlyout(wcsstr(cmd, L"--test-flyout=wifi") ? 1 : 0);
+        SetTimer(nullptr, 0, 4000, [](HWND, UINT, UINT_PTR, DWORD) { PostQuitMessage(0); });
+        MSG m;
+        while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
+        return 0;
+    }
+
     // single instance
     g_mtx = CreateMutexW(nullptr, TRUE, L"GoldenGate_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -367,6 +382,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     // window is dragged to another monitor or minimised without a focus change
     g_moveHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, nullptr,
                                  ForegroundEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    FlyoutHooksStart();
     g_minHook = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr,
                                 ForegroundEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
@@ -388,6 +404,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     if (g_fgHook) UnhookWinEvent(g_fgHook);
     if (g_moveHook) UnhookWinEvent(g_moveHook);
     if (g_minHook) UnhookWinEvent(g_minHook);
+    FlyoutHooksStop();
     if (g_tapHook) UnhookWindowsHookEx(g_tapHook);
     SwitcherStep(false);
     UnregisterHotkeys();

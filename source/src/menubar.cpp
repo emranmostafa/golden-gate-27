@@ -454,8 +454,8 @@ void Bar::OpenStatusMenu(int id, float x) {
         MenuBarRefresh();
         break;
     }
-    case 104: SendKeys({VK_LWIN, VK_CONTROL, 'V'}); break;   // Windows' audio panel (Quick Settings, sound output)
-    case 105: ShellOpen(L"ms-availablenetworks:"); break;
+    case 104: OpenWindowsFlyout(0); break;   // Windows' sound output panel, moved under the panel
+    case 105: OpenWindowsFlyout(1); break;   // Windows' Wi-Fi list, moved under the panel
     case 106: SpotlightToggle(); break;
     default: ControlCenterToggle(a); break;
     }
