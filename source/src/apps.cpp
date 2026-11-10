@@ -188,12 +188,12 @@ std::vector<AppEntry> &AllApps(bool refresh) {
                     {{0xB9B4B3FC, 0x2B51, 0x4A42, {0xB5, 0xD8, 0x32, 0x41, 0x46, 0xAF, 0xCF, 0x25}}, 2};
                 if (SUCCEEDED(i2->GetString(GG_PKEY_Link_TargetParsingPath, &target)) && target) {
                     std::wstring t = Lower(FileNameOf(target));
-                    if (t.size() > 4 && t.substr(t.size() - 4) == L".exe" && t != L"explorer.exe") e.exe = t;
+                    if (t.size() > 4 && t.substr(t.size() - 4) == L".exe" && t != L"explorer.exe") { e.exe = t; e.target = target; }
                 }
                 CoTaskMemFree(target);
                 i2->Release();
             }
-            if (e.id.size() > 3 && Lower(e.id).substr(e.id.size() - 4) == L".exe") e.exe = Lower(FileNameOf(e.id));
+            if (e.id.size() > 3 && Lower(e.id).substr(e.id.size() - 4) == L".exe") { e.exe = Lower(FileNameOf(e.id)); e.target = e.id; }
             if (!e.name.empty()) g_apps.push_back(e);
             else if (e.pidl) CoTaskMemFree(e.pidl);
             item->Release();
@@ -354,7 +354,44 @@ IWICBitmapSource *ShellItemIcon(const std::wstring &parse, int size) {
 
 // the shell's own icon for an app id (desktop or Store). Bare app IDs (Store apps,
 // Chrome/Edge web apps) only resolve under shell:AppsFolder, so try that too.
+// The shell only uses an exe's icon as "large" when it has a 256px image. With any
+// other big size (SessionX ships a single 240px icon) it draws the small icon on a
+// faint placeholder frame instead. In that case load the exe's own largest image.
+// Returns null when the shell's icon is already right (256px present, or no big art).
+IWICBitmapSource *ExeNativeIcon(const std::wstring &exePath) {
+    if (exePath.empty()) return nullptr;
+    HMODULE m = LoadLibraryExW(exePath.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!m) return nullptr;
+    int biggest = 0;
+    // the first icon group is the program's main icon
+    EnumResourceNamesW(m, RT_GROUP_ICON, [](HMODULE mod, LPCWSTR type, LPWSTR name, LONG_PTR lp) -> BOOL {
+        HRSRC r = FindResourceW(mod, name, type);
+        BYTE *d = r ? (BYTE *)LockResource(LoadResource(mod, r)) : nullptr;
+        if (d && SizeofResource(mod, r) >= 6) {
+            int count = *(WORD *)(d + 4);
+            for (int i = 0; i < count && 6 + 14 * (i + 1) <= (int)SizeofResource(mod, r); i++) {
+                int w = d[6 + 14 * i];
+                *(int *)lp = std::max(*(int *)lp, w == 0 ? 256 : w);
+            }
+        }
+        return FALSE;
+    }, (LONG_PTR)&biggest);
+    FreeLibrary(m);
+    if (biggest >= 256 || biggest < 64) return nullptr;
+    HICON big = nullptr;
+    if (SHDefExtractIconW(exePath.c_str(), 0, 0, &big, nullptr, MAKELONG(biggest, 16)) != S_OK || !big) return nullptr;
+    IWICBitmapSource *b = WicFromHIcon(big);
+    DestroyIcon(big);
+    return b;
+}
+
 static IWICBitmapSource *ShellIcon(const std::wstring &id, int size) {
+    // an exe whose large icon the shell would turn into a framed placeholder
+    {
+        const AppEntry *a = FindApp(id);
+        std::wstring path = a ? a->target : (id.find(L":\\") != std::wstring::npos ? id : L"");
+        if (IWICBitmapSource *n = ExeNativeIcon(path)) return n;
+    }
     // best: the Start-menu item itself (its shortcut icon is what the taskbar shows)
     if (const AppEntry *a = FindApp(id)) {
         if (a->pidl) {

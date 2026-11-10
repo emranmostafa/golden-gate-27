@@ -260,11 +260,92 @@ void SaveSettings() {
     IniPutInt(L"features", L"caffeine", s.caffeine);
     IniPutInt(L"windows", L"taskbar", s.taskbar);
     IniPutInt(L"windows", L"startAtLogin", s.startAtLogin);
-    // start at login: per-user Run key
-    const wchar_t *run = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    if (s.startAtLogin) {
-        RegSetString(HKEY_CURRENT_USER, run, L"GoldenGate", L"\"" + JoinPath(g_dir, L"GoldenGate.exe") + L"\"");
-    } else {
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, run, L"GoldenGate");
+    AutostartSync();
+}
+
+// ---------------------------------------------------------- start at login --
+// A per-user Task Scheduler logon task starts Golden Gate the moment you sign in.
+// Windows holds back Run-key programs for several seconds after the desktop and its
+// taskbar appear, so the Run key is only the fallback if the task can't be made.
+// Neither needs admin, and both are removed by turning the setting off or uninstalling.
+static const wchar_t *kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static bool RunHidden(const std::wstring &cmdline) {
+    STARTUPINFOW si = {sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> buf(cmdline.begin(), cmdline.end());
+    buf.push_back(0);
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    WaitForSingleObject(pi.hProcess, 15000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code == 0;
+}
+
+static std::wstring XmlEscape(const std::wstring &s) {
+    std::wstring r;
+    for (wchar_t c : s) {
+        if (c == L'&') r += L"&amp;";
+        else if (c == L'<') r += L"&lt;";
+        else if (c == L'>') r += L"&gt;";
+        else r += c;
     }
+    return r;
+}
+
+static void ApplyAutostart(bool on) {
+    wchar_t sys[MAX_PATH];
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring schtasks = L"\"" + JoinPath(sys, L"schtasks.exe") + L"\"";
+    std::wstring exe = JoinPath(g_dir, L"GoldenGate.exe");
+    if (!on) {
+        RunHidden(schtasks + L" /delete /tn GoldenGate /f");
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"GoldenGate");
+        return;
+    }
+    wchar_t dom[128] = {}, usr[128] = {};
+    GetEnvironmentVariableW(L"USERDOMAIN", dom, 128);
+    GetEnvironmentVariableW(L"USERNAME", usr, 128);
+    std::wstring user = XmlEscape(std::wstring(dom) + L"\\" + usr);
+    std::wstring xml =
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"  <RegistrationInfo><Description>Starts Golden Gate when you sign in.</Description></RegistrationInfo>\r\n"
+        L"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + L"</UserId></LogonTrigger></Triggers>\r\n"
+        L"  <Principals><Principal id=\"Author\"><UserId>" + user + L"</UserId><LogonType>InteractiveToken</LogonType>"
+        L"<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n"
+        L"  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+        L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+        L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority><Enabled>true</Enabled></Settings>\r\n"
+        L"  <Actions Context=\"Author\"><Exec><Command>" + XmlEscape(exe) + L"</Command><Arguments>--autostart</Arguments></Exec></Actions>\r\n"
+        L"</Task>\r\n";
+    std::wstring path = JoinPath(g_dataDir, L"autostart-task.xml");
+    bool ok = false;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD wr;
+        WORD bom = 0xFEFF;
+        WriteFile(f, &bom, 2, &wr, nullptr);
+        WriteFile(f, xml.c_str(), (DWORD)(xml.size() * sizeof(wchar_t)), &wr, nullptr);
+        CloseHandle(f);
+        ok = RunHidden(schtasks + L" /create /tn GoldenGate /xml \"" + path + L"\" /f");
+        DeleteFileW(path.c_str());
+    }
+    if (ok) RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"GoldenGate");
+    else RegSetString(HKEY_CURRENT_USER, kRunKey, L"GoldenGate", L"\"" + exe + L"\" --autostart");
+}
+
+void AutostartSync() {
+    static int applied = -1;
+    if (applied == (int)g_set.startAtLogin) return;
+    applied = g_set.startAtLogin;
+    // schtasks takes a moment: do it off the UI thread
+    HANDLE t = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD { ApplyAutostart(p != nullptr); return 0; },
+                            applied ? (LPVOID)1 : nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    else ApplyAutostart(applied != 0);
 }

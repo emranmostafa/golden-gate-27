@@ -93,6 +93,7 @@ struct Settings {
 };
 extern Settings g_set;
 void LoadSettings();
+void AutostartSync();   // start at login: per-user sign-in task (Run key fallback)
 void SaveSettings();
 
 // ---------------------------------------------------------------- theme ---
@@ -122,6 +123,7 @@ void EnableAcrylic(HWND hwnd, unsigned abgrTint);
 IDWriteTextFormat *Font(float size, DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL,
                         DWRITE_TEXT_ALIGNMENT a = DWRITE_TEXT_ALIGNMENT_LEADING, bool icon = false);
 float TextWidth(const std::wstring &s, float size, DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL, bool icon = false);
+float TextHeight(const std::wstring &s, float size, float maxWidth, DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL);
 D2D1_COLOR_F Rgb(unsigned rgb, float a = 1.f);
 D2D1_COLOR_F WithAlpha(D2D1_COLOR_F c, float a);
 D2D1_COLOR_F Mix(D2D1_COLOR_F a, D2D1_COLOR_F b, float t);
@@ -157,6 +159,7 @@ public:
     void Text(const std::wstring &s, D2D1_RECT_F r, D2D1_COLOR_F c, float size,
               DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL,
               DWRITE_TEXT_ALIGNMENT a = DWRITE_TEXT_ALIGNMENT_LEADING, bool icon = false);
+    void TextWrap(const std::wstring &s, D2D1_RECT_F r, D2D1_COLOR_F c, float size);   // wraps onto more lines
     void Line(float x1, float y1, float x2, float y2, D2D1_COLOR_F c, float w = 1.f);
     void Circle(float cx, float cy, float r, D2D1_COLOR_F c, bool fill = true, float w = 1.f);
     void Bitmap(IWICBitmapSource *src, D2D1_RECT_F r, float opacity = 1.f);
@@ -186,6 +189,7 @@ struct AppEntry {
     std::wstring id;        // AppsFolder parsing name (AUMID or path)
     std::wstring name;      // display name
     std::wstring exe;       // target exe (desktop apps), lower-case
+    std::wstring target;    // full path of that exe, when known
     std::wstring aumid;     // lower-case
     PIDLIST_ABSOLUTE pidl = nullptr;   // the Start-menu item itself (icon + launch), owned by the app list
 };
@@ -200,6 +204,7 @@ IWICBitmapSource *AppIcon(const std::wstring &id, int size = 128, bool bundledFa
 IWICBitmapSource *IconForExe(const std::wstring &exe, const std::wstring &aumid, int size = 128);
 IWICBitmapSource *ThemedIcon(const std::wstring &key);                // assets/icons/<key>.png
 IWICBitmapSource *ShellItemIcon(const std::wstring &parseName, int size = 128);   // file path or shell:AppsFolder\id
+IWICBitmapSource *ExeNativeIcon(const std::wstring &exePath);   // an exe's own large icon when the shell won't use it
 
 struct WinInfo { HWND hwnd; std::wstring title, exe, aumid; DWORD pid; };
 std::vector<WinInfo> ListAppWindows(HMONITOR onlyOn = nullptr);
@@ -216,6 +221,7 @@ void MenuBarStart();   void MenuBarStop();   void MenuBarRefresh();   void MenuB
 void DockStart();      void DockStop();      void DockRefresh();      void DockReassert();      void DockPeriodicRefresh();
 void TaskbarKeepHidden();
 void ControlCenterToggle(RECT anchor);
+void VolumeNudge(int steps);              // +/- 2% per step
 void MissionControlToggle();
 void SwitcherStep(bool start);
 void LaunchpadToggle();
@@ -223,6 +229,8 @@ void SpotlightToggle();
 void ClipboardStart(); void ClipboardStop(); void ClipboardShow(RECT anchor);
 void CaffeineSet(bool on);
 void ShakeTimerTick();
+void PointerGrowStop();   // put the arrow back if a shake left it enlarged
+void MenuBarTrack();   // per-monitor panels: rebuild any whose top app changed
 void HotCornersTick();
 void TaskbarApply();   void TaskbarRestore();
 void SettingsOpen();

@@ -329,3 +329,10 @@ void ControlCenterToggle(RECT anchor) {
     SetForegroundWindow(g_cc->hwnd);
     g_cc->Invalidate();
 }
+
+// scrolling over the panel's volume icon: +/- 2% per notch (clicking it opens
+// Windows' own audio panel, see menubar.cpp)
+void VolumeNudge(int steps) {
+    if (steps > 0 && GetMute()) SetMute(false);
+    SetVolume(GetVolume() + steps * 0.02f);
+}

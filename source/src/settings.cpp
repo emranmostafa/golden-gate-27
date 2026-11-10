@@ -16,6 +16,11 @@ struct Row {
     std::function<void()> click;           // for button
     D2D1_RECT_F rect;                      // filled at paint
     D2D1_RECT_F ctlRect;
+    // sliders: shown after the value ("%", " px"), and an optional cheap live
+    // preview while dragging. set() (save + apply everything) runs once on release.
+    std::wstring unit;
+    std::function<void(int)> preview;
+    std::vector<int> stops;   // labelled detents: the knob sticks to the nearest one
 };
 
 struct Page { std::wstring name, glyph; std::vector<Row> rows; };
@@ -33,9 +38,11 @@ struct SettingsWin : Surface {
     void OnKey(UINT vk) override { if (vk == VK_ESCAPE) Show(false); }
     LRESULT OnMessage(UINT m, WPARAM wp, LPARAM lp, bool &handled) override;
     float sidebarW = 180;
-    int trafficHot = -1;   // 0 close, 1 min, 2 zoom
-    bool zoomed = false;
-    RECT restoreRect = {};
+    static constexpr float kNavTop = 54;   // first sidebar entry (below the "Golden Gate" heading)
+    Row *dragRow = nullptr;   // slider being dragged (mouse captured)
+    int dragVal = 0, dragStart = 0;
+    void SliderTo(float x);
+    void EndSliderDrag();
 };
 static SettingsWin *g_settings = nullptr;
 HWND SettingsHwnd() { return (g_settings && g_settings->Visible()) ? g_settings->hwnd : nullptr; }
@@ -50,6 +57,8 @@ static void ApplyLive() {
     TaskbarApply();
     CaffeineSet(g_set.caffeine);
     if (g_settings && g_settings->hwnd) {
+        BOOL dark = g_pal.dark;   // the Windows title bar follows light/dark too
+        DwmSetWindowAttribute(g_settings->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
         g_settings->Invalidate();
         SetForegroundWindow(g_settings->hwnd);   // keep the window interactive
     }
@@ -111,10 +120,18 @@ void SettingsWin::BuildPages() {
         }, {L"Clear", L"Balanced", L"Tinted"}});
     mb.rows.push_back({C_SLIDER, L"Opacity", L"Lower is clearer; higher is more solid",
         []() { return g_set.panelGlass; }, [](int v) { g_set.panelGlass = v; MenuBarRetint(); ApplyLive(); }, {}, 0, 100});
+    mb.rows.back().unit = L"%";
+    mb.rows.back().stops = {0, 25, 50, 75, 100};
+    mb.rows.back().preview = [](int v) { g_set.panelGlass = v; MenuBarRetint(); };
     mb.rows.push_back({C_SLIDER, L"Tint", L"How much the glass takes on your accent colour",
         []() { return g_set.panelTint; }, [](int v) { g_set.panelTint = v; MenuBarRetint(); ApplyLive(); }, {}, 0, 100});
+    mb.rows.back().unit = L"%";
+    mb.rows.back().stops = {0, 25, 50, 75, 100};
+    mb.rows.back().preview = [](int v) { g_set.panelTint = v; MenuBarRetint(); };
     mb.rows.push_back({C_SLIDER, L"Height", L"Thickness of the panel",
         []() { return g_set.panelHeight; }, [](int v) { g_set.panelHeight = v; MenuBarStop(); MenuBarStart(); ApplyLive(); }, {}, 22, 40});
+    mb.rows.back().unit = L" px";   // rebuilding the panels per pixel lagged: applied on release
+    mb.rows.back().stops = {22, 26, 31, 36, 40};
     mb.rows.push_back({C_HEADER, L"Clock"});
     mb.rows.push_back({C_SWITCH, L"24-hour clock", L"",
         []() { return g_set.clock24; }, [](int v) { g_set.clock24 = v; MenuBarRefresh(); ApplyLive(); }});
@@ -134,6 +151,8 @@ void SettingsWin::BuildPages() {
         []() { return g_set.dock; }, [](int v) { g_set.dock = v; DockStop(); if (v) DockStart(); ApplyLive(); }});
     dk.rows.push_back({C_SLIDER, L"Icon size", L"",
         []() { return g_set.dockSize; }, [](int v) { g_set.dockSize = v; g_set.dockMagnifySize = std::max(g_set.dockMagnifySize, v + 10); DockStop(); DockStart(); ApplyLive(); }, {}, 32, 84});
+    dk.rows.back().unit = L" px";   // restarting the Dock per pixel lagged: applied on release
+    dk.rows.back().stops = {32, 44, 52, 64, 76, 84};
     dk.rows.push_back({C_SWITCH, L"Magnify on hover", L"",
         []() { return g_set.dockMagnify; }, [](int v) { g_set.dockMagnify = v; DockStop(); DockStart(); ApplyLive(); }});
     dk.rows.push_back({C_SEG, L"Hiding", L"Intellihide hides the Dock only when a window overlaps it; push the pointer to the bottom edge to show it",
@@ -157,11 +176,11 @@ void SettingsWin::BuildPages() {
         []() { return g_set.switcher; }, [](int v) { g_set.switcher = v; SwitcherStep(false); if (v) SwitcherStep(true); ApplyLive(); }});
     ft.rows.push_back({C_SWITCH, L"Launchpad", L"A full-screen grid of all apps (Ctrl+Space, or F4)",
         []() { return g_set.launchpad; }, [](int v) { g_set.launchpad = v; ApplyLive(); }});
-    ft.rows.push_back({C_SWITCH, L"Spotlight search", L"A search box (double-tap Ctrl)",
+    ft.rows.push_back({C_SWITCH, L"Spotlight search", L"Tap the Windows key to search; Win+A opens the Start menu",
         []() { return g_set.spotlight; }, [](int v) { g_set.spotlight = v; ApplyLive(); }});
     ft.rows.push_back({C_SWITCH, L"Clipboard history", L"In the menu bar",
         []() { return g_set.clipboard; }, [](int v) { g_set.clipboard = v; ClipboardStop(); if (v) ClipboardStart(); MenuBarRefresh(); ApplyLive(); }});
-    ft.rows.push_back({C_SWITCH, L"Shake to find the pointer", L"Shake the mouse to highlight it",
+    ft.rows.push_back({C_SWITCH, L"Shake to find the pointer", L"Shake the mouse and the pointer grows; keep shaking to make it bigger",
         []() { return g_set.shakeFind; }, [](int v) { g_set.shakeFind = v; ApplyLive(); }});
     ft.rows.push_back({C_SWITCH, L"Caffeine", L"Keep the screen awake",
         []() { return g_set.caffeine; }, [](int v) { g_set.caffeine = v; CaffeineSet(v); MenuBarRefresh(); ApplyLive(); }});
@@ -184,21 +203,14 @@ void SettingsWin::BuildPages() {
 
 void SettingsWin::OnPaint() {
     float w = W(), h = H();
-    Fill(D2D1::RectF(0, 0, w, h), g_pal.panelStrong, 0);
+    // opaque base: with the standard frame there's no glass behind the content
+    Fill(D2D1::RectF(0, 0, w, h), WithAlpha(g_pal.panelStrong, 1.f), 0);
     // sidebar
     Fill(D2D1::RectF(0, 0, sidebarW, h), g_pal.panel, 0);
     Line(sidebarW, 0, sidebarW, h, g_pal.separator);
-    // macOS traffic-light window buttons, top-left
-    const unsigned tl[3] = {0xFF5F57, 0xFEBC2E, 0x28C840};
-    const wchar_t *tlg[3] = {L"✕", L"−", L"↗"};
-    for (int i = 0; i < 3; i++) {
-        float cx = 20 + i * 20, cy = 22;
-        Circle(cx, cy, 6.5f, Rgb(tl[i]), true);
-        if (trafficHot >= 0)   // show glyphs when hovering the group
-            Text(tlg[i], D2D1::RectF(cx - 7, cy - 7, cx + 7, cy + 7), Rgb(0x4D0000, 0.6f), 8.5f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
-    }
-    Text(L"Golden Gate", D2D1::RectF(18, 44, sidebarW - 10, 70), g_pal.text, 15, DWRITE_FONT_WEIGHT_BOLD);
-    float y = 84;
+    // the window buttons are Windows' own, in the standard title bar above
+    Text(L"Golden Gate", D2D1::RectF(18, 14, sidebarW - 10, 40), g_pal.text, 15, DWRITE_FONT_WEIGHT_BOLD);
+    float y = kNavTop;
     for (int i = 0; i < (int)pages.size(); i++) {
         D2D1_RECT_F r = D2D1::RectF(10, y, sidebarW - 10, y + 36);
         if (i == page) Fill(r, g_pal.accent, 8);
@@ -220,15 +232,29 @@ void SettingsWin::OnPaint() {
             y += 40;
             continue;
         }
-        float rh = row.sub.empty() ? 52 : 60;
+        // the control's width first, so the label and description use only the
+        // space to its left (wider controls used to sit on top of the text), and
+        // the row grows when a long description wraps instead of clipping it
+        float ctlR = cx + cw - 16;
+        float ctlW = 0;
+        switch (row.type) {
+        case C_SWITCH: ctlW = 44; break;
+        case C_SEG:    ctlW = 72.f * row.options.size(); break;
+        case C_SLIDER: ctlW = 200 + 56; break;   // value label + track
+        case C_CHOICE: ctlW = 180; break;
+        case C_COLOR:  ctlW = (24 + 8) * 8 - 8; break;
+        default: break;
+        }
+        float textL = cx + 16, textR = ctlW > 0 ? ctlR - ctlW - 20 : ctlR;
+        float subH = row.sub.empty() ? 0 : TextHeight(row.sub, 11.5f, textR - textL);
+        float rh = row.sub.empty() ? 52 : std::max(60.f, 30 + subH + 14);
         row.rect = D2D1::RectF(cx, y, cx + cw, y + rh);
         Fill(D2D1::RectF(cx, y, cx + cw, y + rh - 6), g_pal.panel, 12);
-        Text(row.label, D2D1::RectF(cx + 16, y + (row.sub.empty() ? 0 : 8), cx + cw - 220, y + (row.sub.empty() ? rh - 6 : 32)),
+        Text(row.label, D2D1::RectF(textL, y + (row.sub.empty() ? 0 : 8), textR, y + (row.sub.empty() ? rh - 6 : 30)),
              g_pal.text, 13.5f, DWRITE_FONT_WEIGHT_MEDIUM);
         if (!row.sub.empty())
-            Text(row.sub, D2D1::RectF(cx + 16, y + 30, cx + cw - 180, y + rh - 8), g_pal.textDim, 11.5f);
+            TextWrap(row.sub, D2D1::RectF(textL, y + 30, textR, y + 30 + subH + 2), g_pal.textDim, 11.5f);
         // control on the right
-        float ctlR = cx + cw - 16;
         if (row.type == C_SWITCH) {
             bool on = row.get() != 0;
             float sw = 44, sh = 26, sx = ctlR - sw, sy = y + (rh - 6 - sh) / 2;
@@ -246,12 +272,30 @@ void SettingsWin::OnPaint() {
             }
             row.ctlRect = D2D1::RectF(sx, sy, sx + totW, sy + 28);
         } else if (row.type == C_SLIDER) {
-            float sw = 160, sx = ctlR - sw, sy = y + (rh - 6) / 2;
+            // track with labelled stops underneath; the current value on the left
+            float sw = 200, sx = ctlR - sw, sy = y + (rh - 6) / 2 - (row.stops.empty() ? 0 : 7);
+            bool dragging = (&row == dragRow);
+            int val = dragging ? dragVal : row.get();
+            float span = (float)std::max(1, row.max - row.min);
+            auto xOf = [&](int v) { return sx + sw * std::max(0.f, std::min(1.f, (v - row.min) / span)); };
+            float kx = xOf(val);
             Fill(D2D1::RectF(sx, sy - 3, sx + sw, sy + 3), g_pal.hover, 3);
-            float frac = (float)(row.get() - row.min) / (row.max - row.min);
-            Fill(D2D1::RectF(sx, sy - 3, sx + sw * frac, sy + 3), g_pal.accent, 3);
-            Circle(sx + sw * frac, sy, 9, Rgb(0xFFFFFF), true);
-            Circle(sx + sw * frac, sy, 9, g_pal.separator, false, 1);
+            Fill(D2D1::RectF(sx, sy - 3, kx, sy + 3), g_pal.accent, 3);
+            for (int s : row.stops) {
+                float tx = xOf(s);
+                bool on = (s == val);
+                Circle(tx, sy, 2.f, s <= val ? WithAlpha(Rgb(0xFFFFFF), 0.8f) : g_pal.textFaint, true);
+                wchar_t lb[16];
+                swprintf(lb, 16, L"%d%ls", s, row.unit == L"%" ? L"%" : L"");
+                Text(lb, D2D1::RectF(tx - 22, sy + 10, tx + 22, sy + 25), on ? g_pal.text : g_pal.textDim, 10.5f,
+                     on ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+            float kr = dragging ? 10.f : 9.f;
+            Circle(kx, sy, kr, Rgb(0xFFFFFF), true);
+            Circle(kx, sy, kr, g_pal.separator, false, 1);
+            wchar_t vb[24];
+            swprintf(vb, 24, L"%d%ls", val, row.unit.c_str());
+            Text(vb, D2D1::RectF(sx - 56, sy - 10, sx - 16, sy + 10), g_pal.text, 12, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_TRAILING);
             row.ctlRect = D2D1::RectF(sx, sy - 12, sx + sw, sy + 12);
         } else if (row.type == C_CHOICE) {
             float cwid = 180, sx = ctlR - cwid, sy = y + (rh - 6 - 28) / 2;
@@ -284,32 +328,50 @@ void SettingsWin::OnPaint() {
     }
 }
 
+// Slider drag: the knob sticks to the nearest labelled stop and only moves on
+// once the pointer passes halfway to the next. While dragging only the cheap
+// preview runs (if any); the full set() (save + apply) runs once on release.
+void SettingsWin::SliderTo(float x) {
+    Row &r = *dragRow;
+    D2D1_RECT_F c = r.ctlRect;
+    float f = std::max(0.f, std::min(1.f, (x - c.left) / std::max(1.f, c.right - c.left)));
+    float raw = r.min + f * (r.max - r.min);
+    int v = (int)lroundf(raw);
+    if (!r.stops.empty()) {
+        v = r.stops[0];
+        for (int s : r.stops) if (fabsf(s - raw) < fabsf(v - raw)) v = s;
+    }
+    if (v != dragVal) {
+        dragVal = v;
+        if (r.preview) r.preview(v);
+        Invalidate();
+    }
+}
+void SettingsWin::EndSliderDrag() {
+    if (!dragRow) return;
+    Row *r = dragRow;
+    dragRow = nullptr;
+    if (GetCapture() == hwnd) ReleaseCapture();
+    if (dragVal != dragStart) r->set(dragVal);
+    Invalidate();
+}
+
 void SettingsWin::OnMouse(UINT msg, float x, float y, WPARAM wp) {
     if (msg == WM_MOUSEWHEEL) {
         scroll = std::max(0.f, scroll - GET_WHEEL_DELTA_WPARAM(wp) / 3.f);
         Invalidate();
         return;
     }
+    if (dragRow) {   // mouse is captured: follow it anywhere until release
+        if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) SliderTo(x);
+        if (msg == WM_LBUTTONUP) EndSliderDrag();
+        return;
+    }
     bool down = (msg == WM_LBUTTONDOWN);
     bool drag = (msg == WM_MOUSEMOVE && (wp & MK_LBUTTON));
     bool up = (msg == WM_LBUTTONUP);
-    // traffic-light buttons (top-left): close / minimize / zoom
-    int th = -1;
-    for (int i = 0; i < 3; i++) { float cx = 20 + i * 20; if (fabsf(x - cx) < 9 && fabsf(y - 22) < 9) th = i; }
-    if (th != trafficHot && y < 44) { trafficHot = th; Invalidate(); }
-    if (up && th >= 0) {
-        if (th == 0) Show(false);
-        else if (th == 1) ShowWindow(hwnd, SW_MINIMIZE);
-        else if (th == 2) {   // zoom: toggle between the window size and the work area
-            MONITORINFO mi = {sizeof(mi)};
-            GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-            if (!zoomed) { GetWindowRect(hwnd, &restoreRect); zoomed = true; Move(mi.rcWork); }
-            else { zoomed = false; Move(restoreRect); }
-        }
-        return;
-    }
-    if (down && x < sidebarW && y >= 72) {
-        int i = (int)((y - 84) / 40);
+    if (down && x < sidebarW && y >= kNavTop - 4) {
+        int i = (int)((y - kNavTop) / 40);
         if (i >= 0 && i < (int)pages.size()) { page = i; scroll = 0; Invalidate(); }
         return;
     }
@@ -324,10 +386,11 @@ void SettingsWin::OnMouse(UINT msg, float x, float y, WPARAM wp) {
             o = std::max(0, std::min((int)row.options.size() - 1, o));
             row.set(o); Invalidate(); return;
         }
-        if (row.type == C_SLIDER && (down || drag)) {
-            float frac = (x - c.left) / (c.right - c.left);
-            frac = std::max(0.f, std::min(1.f, frac));
-            row.set(row.min + (int)(frac * (row.max - row.min) + 0.5f));
+        if (row.type == C_SLIDER && down) {
+            dragRow = &row;
+            dragVal = dragStart = row.get();
+            SetCapture(hwnd);
+            SliderTo(x);
             Invalidate(); return;
         }
         if (row.type == C_COLOR && up) {
@@ -358,13 +421,16 @@ void SettingsWin::OnMouse(UINT msg, float x, float y, WPARAM wp) {
 }
 
 LRESULT SettingsWin::OnMessage(UINT m, WPARAM wp, LPARAM lp, bool &handled) {
-    if (m == WM_NCHITTEST) {
-        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        ScreenToClient(hwnd, &pt);
-        float fx = pt.x / scale, fy = pt.y / scale;
-        // drag by the top strip (right of the traffic lights), and the sidebar header
-        bool onLight = fy < 44 && fx < 80;
-        if (!onLight && ((fy < 44) || (fx < sidebarW && fy < 72))) { handled = true; return HTCAPTION; }
+    // Windows' own title bar: its close button hides Settings (it's reopened often
+    // and keeps its state) instead of destroying the window under us
+    if (m == WM_CLOSE) { Show(false); handled = true; return 0; }
+    // capture taken away mid-drag (Alt+Tab, a popup): keep where the knob got to
+    if (m == WM_CAPTURECHANGED && dragRow && (HWND)lp != hwnd) { EndSliderDrag(); handled = true; return 0; }
+    if (m == WM_GETMINMAXINFO) {
+        auto *mm = (MINMAXINFO *)lp;
+        mm->ptMinTrackSize = {(LONG)(620 * scale), (LONG)(420 * scale)};
+        handled = true;
+        return 0;
     }
     handled = false;
     return 0;
@@ -382,7 +448,22 @@ void SettingsOpen() {
     RECT r = {cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2};
     g_settings->BuildPages();
     g_settings->Create(Surface::Glass, L"Golden Gate Settings", WS_EX_APPWINDOW, r, nullptr, true);
-    // give it a normal resizable frame feel: caption drag via hit-test
+    // a standard Windows window: title bar with minimise / maximise / close,
+    // resizable border, snap. Surfaces are borderless tool windows by default, so
+    // swap the styles, then grow the window so the content keeps its size.
+    HWND win = g_settings->hwnd;
+    DWORD style = WS_OVERLAPPEDWINDOW;
+    DWORD ex = (GetWindowLongW(win, GWL_EXSTYLE) & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW;
+    SetWindowLongW(win, GWL_STYLE, style);
+    SetWindowLongW(win, GWL_EXSTYLE, ex);
+    MARGINS none = {0, 0, 0, 0};   // the frame stays Windows' own, not stretched glass
+    DwmExtendFrameIntoClientArea(win, &none);
+    RECT wr = r;
+    AdjustWindowRectExForDpi(&wr, style, FALSE, ex, (UINT)(96 * sc));
+    SetWindowPos(win, nullptr, wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+                 SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+    HICON ico = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+    if (ico) { SendMessageW(win, WM_SETICON, ICON_BIG, (LPARAM)ico); SendMessageW(win, WM_SETICON, ICON_SMALL, (LPARAM)ico); }
     g_settings->Show(true, true);
     SetForegroundWindow(g_settings->hwnd);
 }

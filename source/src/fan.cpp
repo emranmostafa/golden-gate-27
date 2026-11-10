@@ -38,6 +38,8 @@ static IWICBitmapSource *FileThumb(const std::wstring &path, int size) {
     return src;
 }
 
+static ULONGLONG g_fanClosedAt = 0;   // see DownloadsFanDismiss
+
 struct Fan : Surface {
     struct Tile {
         std::wstring path, name;
@@ -62,7 +64,11 @@ struct Fan : Surface {
     void OnMouseLeave() override { if (hot != -1) { hot = -1; Invalidate(); } }
     void OnActivate(bool a) override { if (!a) Close(); }
     void OnKey(UINT vk) override { if (vk == VK_ESCAPE) Close(); }
-    void Close() { if (anim) { KillTimer(nullptr, anim); anim = 0; } Destroy(); }
+    void Close() {
+        if (anim) { KillTimer(nullptr, anim); anim = 0; }
+        if (hwnd) g_fanClosedAt = GetTickCount64();
+        Destroy();
+    }
     void PaintFan();
     void PaintGrid();
     int HitAt(float x, float y);
@@ -71,6 +77,13 @@ struct Fan : Surface {
 
 static Fan *g_fan = nullptr;
 bool DownloadsFanOpen() { return g_fan && g_fan->hwnd && IsWindowVisible(g_fan->hwnd); }
+
+// The Dock's Downloads button is a toggle: a click while the stack is open closes
+// it. If that same click already closed it (by taking focus away), don't reopen.
+bool DownloadsFanDismiss() {
+    if (DownloadsFanOpen()) { g_fan->Close(); return true; }
+    return GetTickCount64() - g_fanClosedAt < 300;
+}
 
 static float Ease(float p) { p = std::max(0.f, std::min(1.f, p)); return 1 - (1 - p) * (1 - p) * (1 - p); }
 

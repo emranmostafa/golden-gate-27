@@ -93,6 +93,20 @@ float TextWidth(const std::wstring &s, float size, DWRITE_FONT_WEIGHT w, bool ic
     }
     return r;
 }
+// height of text wrapped to maxWidth
+float TextHeight(const std::wstring &s, float size, float maxWidth, DWRITE_FONT_WEIGHT w) {
+    IDWriteTextLayout *l = nullptr;
+    float r = 0;
+    if (SUCCEEDED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), Font(size, w, DWRITE_TEXT_ALIGNMENT_LEADING, false),
+                                         std::max(1.f, maxWidth), 4000, &l))) {
+        l->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);   // the shared formats don't wrap
+        DWRITE_TEXT_METRICS m;
+        l->GetMetrics(&m);
+        r = m.height;
+        l->Release();
+    }
+    return r;
+}
 
 D2D1_COLOR_F Rgb(unsigned rgb, float a) {
     return D2D1::ColorF(((rgb >> 16) & 255) / 255.f, ((rgb >> 8) & 255) / 255.f, (rgb & 255) / 255.f, a);
@@ -165,23 +179,6 @@ IWICBitmapSource *WicFromHIcon(HICON hi) {
     return ToPbgra(b);
 }
 
-// An exe with no large icon comes back from the shell as its small icon centred on
-// a blank, square-cornered white page. Spot that page: opaque near-white all round
-// a ring 20% in, and still opaque right by the corners (a real white app tile has
-// rounded corners, so it's transparent there and is left alone).
-static bool IsBlankPage(const std::vector<BYTE> &px, int w, int h) {
-    auto at = [&](int x, int y) { return &px[(size_t)y * w * 4 + (size_t)x * 4]; };
-    if (w != h || w < 64) return false;
-    int c = w * 3 / 100;
-    if (at(c, c)[3] < 200 || at(w - 1 - c, h - 1 - c)[3] < 200) return false;
-    int a = w / 5, b = w - 1 - a;
-    for (int i = a; i <= b; i += std::max(1, (b - a) / 16)) {
-        const BYTE *p[4] = {at(i, a), at(i, b), at(a, i), at(b, i)};
-        for (auto q : p) if (q[3] < 200 || q[0] < 235 || q[1] < 235 || q[2] < 235) return false;
-    }
-    return true;
-}
-
 // Windows icons have no shared safe area: some fill their canvas, others (the
 // bundled set) leave 10-25% empty, so equal-sized squares look like unequal icons.
 // Trim each to its visible artwork and re-pad so the longest side is the same share
@@ -197,14 +194,10 @@ IWICBitmapSource *NormalizeIcon(IWICBitmapSource *src) {
     int w = (int)uw, h = (int)uh;
     std::vector<BYTE> px((size_t)w * h * 4);
     if (w && h && SUCCEEDED(src->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
-        bool page = IsBlankPage(px, w, h);
-        int skip = page ? w / 10 : 0;   // ignore the page's own border
         int x0 = w, y0 = h, x1 = -1, y1 = -1;
-        for (int y = skip; y < h - skip; y++)
-            for (int x = skip; x < w - skip; x++) {
-                const BYTE *p = &px[(size_t)y * w * 4 + (size_t)x * 4];
-                bool ink = page ? (p[0] < 235 || p[1] < 235 || p[2] < 235) : p[3] > 32;
-                if (!ink) continue;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                if (px[(size_t)y * w * 4 + (size_t)x * 4 + 3] <= 32) continue;   // visible artwork only
                 x0 = std::min(x0, x); x1 = std::max(x1, x);
                 y0 = std::min(y0, y); y1 = std::max(y1, y);
             }
@@ -391,6 +384,17 @@ void Surface::Text(const std::wstring &s, D2D1_RECT_F r, D2D1_COLOR_F c, float s
     if (s.empty()) return;
     brush->SetColor(c);
     rt->DrawTextW(s.c_str(), (UINT32)s.size(), Font(size, w, a, icon), r, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+void Surface::TextWrap(const std::wstring &s, D2D1_RECT_F r, D2D1_COLOR_F c, float size) {
+    if (s.empty()) return;
+    IDWriteTextLayout *l = nullptr;
+    if (FAILED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), Font(size, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false),
+                                      std::max(1.f, r.right - r.left), std::max(1.f, r.bottom - r.top), &l)))
+        return;
+    l->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    brush->SetColor(c);
+    rt->DrawTextLayout(D2D1::Point2F(r.left, r.top), l, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    l->Release();
 }
 void Surface::Line(float x1, float y1, float x2, float y2, D2D1_COLOR_F c, float w) {
     brush->SetColor(c);
