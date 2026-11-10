@@ -136,7 +136,7 @@ void LaunchpadToggle() {
     g_lp->Create(Surface::Glass, L"GoldenGateLaunchpad", WS_EX_TOPMOST, mi.rcMonitor, nullptr, false);
     g_lp->Build();
     g_lp->Show(true, true);
-    SetForegroundWindow(g_lp->hwnd);
+    ForceForeground(g_lp->hwnd);
     g_lp->anim = SetTimer(nullptr, 0, 16, LPAnim);
 }
 
@@ -148,6 +148,12 @@ struct Spotlight : Surface {
     int sel = 0;
     bool closing = false;
     int openTop = 0;        // where the search box sits (screen px)
+    // typing cursor, blinking at the system rate; the same timer closes Spotlight
+    // when another window takes focus (in case it never got focus to lose)
+    bool caretOn = true;
+    UINT_PTR tick = 0;
+    ULONGLONG lastBlink = 0;
+    HWND fgAtOpen = nullptr;
     void Search();
     void OnPaint() override;
     void OnKey(UINT vk) override;
@@ -210,6 +216,10 @@ void Spotlight::OnPaint() {
     Text(L"", D2D1::RectF(18, 0, 50, 56), g_pal.textDim, 20, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     Text(query.empty() ? L"Spotlight Search" : query, D2D1::RectF(54, 0, w - 16, 56),
          query.empty() ? g_pal.textFaint : g_pal.text, 20, DWRITE_FONT_WEIGHT_NORMAL);
+    if (caretOn) {   // the typing cursor: after the text (before the placeholder)
+        float cx = std::min(w - 18, 54 + (query.empty() ? 0.f : TextWidth(query, 20)) + 1);
+        Fill(D2D1::RectF(cx, 16, cx + 2, 40), g_pal.accent, 1);
+    }
     float y = 56;
     for (int i = 0; i < (int)results.size() && i < 8; i++) {
         float rowH = 52;
@@ -235,7 +245,7 @@ void Spotlight::OnMouse(UINT msg, float x, float y, WPARAM) {
 void Spotlight::OnKey(UINT vk) {
     if (vk == VK_ESCAPE) { Close(); return; }
     if (vk == VK_RETURN) { Run(sel); return; }
-    if (vk == VK_BACK) { if (!query.empty()) { query.pop_back(); Search(); } return; }
+    if (vk == VK_BACK) { if (!query.empty()) { query.pop_back(); caretOn = true; lastBlink = GetTickCount64(); Search(); } return; }
     if (vk == VK_DOWN && sel < (int)results.size() - 1) { sel++; Invalidate(); }
     if (vk == VK_UP && sel > 0) { sel--; Invalidate(); }
 }
@@ -243,7 +253,7 @@ void Spotlight::OnKey(UINT vk) {
 LRESULT Spotlight::OnMessage(UINT m, WPARAM wp, LPARAM lp, bool &handled) {
     if (m == WM_CHAR) {
         wchar_t c = (wchar_t)wp;
-        if (c >= L' ') { query += c; Search(); handled = true; return 0; }
+        if (c >= L' ') { query += c; caretOn = true; lastBlink = GetTickCount64(); Search(); handled = true; return 0; }
     }
     handled = false;
     return 0;
@@ -263,6 +273,7 @@ void Spotlight::Run(int i) {
 void Spotlight::Close() {
     if (closing) return;
     closing = true;
+    if (tick) { KillTimer(nullptr, tick); tick = 0; }
     Destroy();          // detaches us from the window first, so no re-entry
     g_sl = nullptr;
     delete this;
@@ -282,6 +293,22 @@ void SpotlightToggle() {
     RECT r = {cx - w / 2, top, cx + w / 2, top + h};
     g_sl->Create(Surface::Glass, L"GoldenGateSpotlight", WS_EX_TOPMOST, r, nullptr, true);
     g_sl->Show(true, true);
-    SetForegroundWindow(g_sl->hwnd);
+    ForceForeground(g_sl->hwnd);
+    g_sl->fgAtOpen = GetForegroundWindow();
+    g_sl->lastBlink = GetTickCount64();
+    g_sl->tick = SetTimer(nullptr, 0, 50, [](HWND, UINT, UINT_PTR, DWORD) {
+        if (!g_sl) return;
+        // another window took focus (a click elsewhere): close, even if Spotlight
+        // itself never got focus and so never sees "deactivated"
+        HWND fg = GetForegroundWindow();
+        if (fg && fg != g_sl->hwnd && fg != g_sl->fgAtOpen) { g_sl->Close(); return; }
+        ULONGLONG now = GetTickCount64();
+        UINT blink = GetCaretBlinkTime();
+        if (blink != INFINITE && now - g_sl->lastBlink >= blink) {
+            g_sl->caretOn = !g_sl->caretOn;
+            g_sl->lastBlink = now;
+            g_sl->Invalidate();
+        }
+    });
     g_sl->Invalidate();
 }
