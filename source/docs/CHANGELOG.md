@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.4.1 — Window previews, dot colour, icons for every app
+- **Window previews:** right-clicking a running app in the Dock shows a live
+  preview of each of its windows above the icon. Click one to switch to it, or
+  the × to close it; New Window, Show All Windows, Keep in Dock and Quit sit
+  underneath. Minimised windows show the app icon.
+- **Running dot colour:** Settings → Dock → Running dot colour: automatic grey,
+  your accent colour, or white, blue, green, orange, red or purple.
+- **Icons for every app:** programs without a 256 px icon (RustDesk ships only
+  48 px) now show their own icon instead of Windows' framed placeholder, also
+  when the Start-menu entry is recorded under a folder ID.
+- **One icon per app:** windows of the same app that report different app IDs
+  (SessionX) all appear under its one Dock icon, in its window list and in
+  click-to-cycle.
+
 ## v2.4 — Panel popups at the top, Windows-key Spotlight, a smoother Dock
 - **Real app icons in the Dock:** apps are matched to their Start-menu item by
   app ID, then by what the shortcut runs, so VS Code, Snipping Tool and Store
