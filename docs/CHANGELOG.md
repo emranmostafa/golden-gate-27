@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.4.2 — Panel space, full screen, Dock reordering
+- **Panel keeps its space:** when Windows rearranges the screen edges (the
+  taskbar switching to auto-hide at start-up, Explorer restarting, another
+  docked bar appearing) the panel now claims its strip again, so maximized
+  windows stay below it instead of sliding underneath. A check every clock
+  tick re-reserves the strip if Windows ever drops it.
+- **Full screen means full screen:** a video in full screen (YouTube, any
+  player), a browser in F11 or a game now covers the whole monitor. The panel
+  and the Dock hide on that monitor and return as soon as it leaves full screen
+  or another window comes to the front. Small always-on-top windows such as
+  picture-in-picture don't bring them back.
+- **Reorder the Dock by dragging:** dragging a pinned app along the Dock
+  moves it again, and the new order is kept. The drag no longer drops when the
+  pointer drifts just above the icons, isn't undone by a refresh halfway
+  through, and the icon no longer jumps back and forth between two magnified
+  neighbours.
+
 ## v2.4.1 — Window previews, dot colour, icons for every app
 - **Window previews:** right-clicking a running app in the Dock shows a live
   preview of each of its windows above the icon. Click one to switch to it, or
