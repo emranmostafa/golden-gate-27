@@ -175,31 +175,16 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// A true fullscreen app (borderless, filling the whole monitor) should be left
-// alone; a merely maximized window should not hide the bar or Dock.
-static bool ForegroundIsTrueFullscreen() {
-    HWND fg = GetForegroundWindow();
-    if (!fg || IsZoomed(fg)) return false;
-    wchar_t cls[64];
-    GetClassNameW(fg, cls, 64);
-    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"GoldenGateSurface")) return false;
-    LONG style = GetWindowLongW(fg, GWL_STYLE);
-    if (style & WS_CAPTION) return false;
-    RECT wr;
-    GetWindowRect(fg, &wr);
-    MONITORINFO mi = {sizeof(mi)};
-    GetMonitorInfo(MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY), &mi);
-    return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
-           wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
-}
-
 // keep the menu bar and Dock above the active window (Windows otherwise hides
 // registered app-bars when a maximized window is focused, or buries them on
 // Alt+Tab). Runs often, and from the foreground WinEvent for an instant reaction.
+// A full-screen app (borderless, filling its monitor) is left alone: the panel
+// and Dock on that monitor hide until it leaves full screen.
 void CALLBACK ReassertTimer(HWND, UINT, UINT_PTR, DWORD) {
     TaskbarKeepHidden();        // keep the Windows taskbar down so it can't
                                 // cover the Dock's bottom reveal edge
-    if (ForegroundIsTrueFullscreen()) return;
+    MenuBarFullscreenSync();
+    DockFullscreenSync();
     MenuBarReassert();
     DockReassert();
 }
@@ -249,7 +234,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_APP + 72:   // foreground app changed
         MenuBarRefresh();
         DockRefresh();
-        if (!ForegroundIsTrueFullscreen()) { MenuBarReassert(); DockReassert(); }
+        MenuBarFullscreenSync();
+        DockFullscreenSync();
+        MenuBarReassert();
+        DockReassert();
         return 0;
     case WM_GG_THEME:
         MenuBarRefresh();

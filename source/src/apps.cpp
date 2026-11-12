@@ -57,6 +57,53 @@ static HWND CoreWindowOf(HWND frame) {
     }, (LPARAM)&found);
     return found;
 }
+// A full-screen window covers its whole monitor: a browser playing video full
+// screen or in F11, a media player, a game. A maximized window with a title bar
+// is not one (without a reserved panel strip it can also reach the screen edges).
+// Our own windows (Launchpad, Mission Control) don't count.
+bool IsFullscreenWindow(HWND h) {
+    if (!h || !IsWindowVisible(h) || IsIconic(h)) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId()) return false;
+    wchar_t cls[64];
+    GetClassNameW(h, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd") ||
+        !wcscmp(cls, L"Shell_SecondaryTrayWnd"))
+        return false;
+    LONG st = GetWindowLongW(h, GWL_STYLE);
+    if (IsZoomed(h) && (st & WS_CAPTION) == WS_CAPTION) return false;
+    RECT wr;
+    GetWindowRect(h, &wr);
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+    return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
+           wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+}
+
+// Is the window on top of this monitor full screen? The focused window answers
+// it directly when it's on that monitor (the common case, no window scan);
+// otherwise walk the z-order to the top app window there. Small always-on-top
+// windows (picture-in-picture, sticky notes) float over a full-screen video, so
+// they're looked past.
+bool MonitorHasFullscreen(HMONITOR mon) {
+    HWND fg = GetForegroundWindow();
+    if (fg && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == mon) {
+        if (IsFullscreenWindow(fg)) return true;
+        if (IsAppWindow(fg) && !(GetWindowLongW(fg, GWL_EXSTYLE) & WS_EX_TOPMOST)) return false;
+    }
+    struct Scan { HMONITOR mon; bool fs; } s = {mon, false};
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto *s = (Scan *)lp;
+        if (IsIconic(h) || !IsWindowVisible(h)) return TRUE;
+        if (MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != s->mon) return TRUE;
+        if (IsFullscreenWindow(h)) { s->fs = true; return FALSE; }
+        if (!IsAppWindow(h) || (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) return TRUE;
+        return FALSE;   // a normal app window is on top: not full screen
+    }, (LPARAM)&s);
+    return s.fs;
+}
+
 HWND RealAppWindow(HWND h) {
     std::wstring exe = WindowExe(h);
     if (exe == L"applicationframehost.exe") {

@@ -210,6 +210,8 @@ IWICBitmapSource *ExeNativeIcon(const std::wstring &exePath);   // an exe's own 
 struct WinInfo { HWND hwnd; std::wstring title, exe, aumid; DWORD pid; };
 std::vector<WinInfo> ListAppWindows(HMONITOR onlyOn = nullptr);
 bool IsAppWindow(HWND h);
+bool IsFullscreenWindow(HWND h);       // fills its whole monitor (video/F11/game), not just maximized
+bool MonitorHasFullscreen(HMONITOR mon);   // the top app window on that monitor is full screen
 std::wstring WindowExe(HWND h, DWORD *pidOut = nullptr);
 std::wstring WindowAumid(HWND h);
 HWND RealAppWindow(HWND h);           // for ApplicationFrameHost (Store apps), the app inside
@@ -221,6 +223,7 @@ void ForceForeground(HWND h);   // focus one of our windows even when Windows' f
 // -------------------------------------------------------------- modules ---
 void MenuBarStart();   void MenuBarStop();   void MenuBarRefresh();   void MenuBarReassert();   void MenuBarRetint();
 void DockStart();      void DockStop();      void DockRefresh();      void DockReassert();      void DockPeriodicRefresh();
+void MenuBarFullscreenSync();   void DockFullscreenSync();   // step aside for a full-screen app
 void TaskbarKeepHidden();
 void ControlCenterToggle(RECT anchor);
 void VolumeNudge(int steps);              // +/- 2% per step

@@ -50,7 +50,11 @@ struct Dock : Surface {
     void Relayout(bool animate);
     void OnPaint() override;
     void OnMouse(UINT msg, float x, float y, WPARAM) override;
-    void OnMouseLeave() override { hoverX = -1; hot = -1; Relayout(true); }
+    void OnMouseLeave() override {
+        if (dragIndex >= 0 && GetCapture() == hwnd) return;   // mid-drag: we still own the mouse
+        hoverX = -1; hot = -1; Relayout(true);
+    }
+    void EndDrag(bool commit);
     float TargetSize(float center, float cursor);
     int HitItem(float x);
     void Activate(int i, bool rightClick);
@@ -165,6 +169,9 @@ static std::vector<std::wstring> RecentDownloads(int max) {
 }
 
 void Dock::Rebuild() {
+    // a refresh mid-drag (focus change, app opened) would put the icons back in
+    // the saved order under the pointer; the drop rebuilds anyway
+    if (dragging) return;
     std::vector<DockItem> old = std::move(items);
     items.clear();
     auto prevSize = [&](const std::wstring &id) -> float {
@@ -484,6 +491,13 @@ void Dock::IntelliTick() {
 }
 
 LRESULT Dock::OnMessage(UINT msg, WPARAM wp, LPARAM lp, bool &handled) {
+    if (msg == WM_CAPTURECHANGED && dragIndex >= 0 && (HWND)lp != hwnd) {
+        // something took the mouse mid-drag (a popup, Alt+Tab): keep the order
+        // reached so far rather than snapping back
+        EndDrag(true);
+        handled = true;
+        return 0;
+    }
     if (msg == WM_NCHITTEST) {
         // let clicks in the empty side margins of the fixed-width window fall
         // through to whatever is beneath (see PERFORMANCE_AUDIT.md, P0)
@@ -565,6 +579,11 @@ void Dock::OnMouse(UINT msg, float x, float y, WPARAM) {
         dragIndex = (h >= 0 && items[h].pinned) ? h : -1;   // only pinned icons reorder
         dragGrabX = cx;
         dragging = false;
+        // keep every mouse message until the button is released: the Dock is a
+        // layered window, so without capture the pointer drifting onto a
+        // transparent pixel (just above the icons) sends the move and the
+        // release to the window behind, and the drop is lost
+        if (dragIndex >= 0) SetCapture(hwnd);
         hoverX = cx; hot = h; Relayout(true);
         return;
     }
@@ -573,12 +592,16 @@ void Dock::OnMouse(UINT msg, float x, float y, WPARAM) {
         if (dragIndex >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000)) {
             if (!dragging && fabsf(cx - dragGrabX) > 8) dragging = true;
             if (dragging) {
-                int target = HitItem(cx);
-                if (target >= 0 && target < (int)items.size() && items[target].pinned && target != dragIndex) {
-                    DockItem moved = items[dragIndex];
-                    items.erase(items.begin() + dragIndex);
-                    items.insert(items.begin() + target, moved);
-                    dragIndex = target;
+                // step one slot at a time once the pointer passes the neighbour's
+                // centre; neighbours are magnified to different sizes, so a plain
+                // "which slot is under the pointer" test made the icon bounce
+                while (dragIndex + 1 < (int)items.size() && items[dragIndex + 1].pinned && x > x_of(dragIndex + 1)) {
+                    std::swap(items[dragIndex], items[dragIndex + 1]);
+                    dragIndex++;
+                }
+                while (dragIndex > 0 && items[dragIndex - 1].pinned && x < x_of(dragIndex - 1)) {
+                    std::swap(items[dragIndex], items[dragIndex - 1]);
+                    dragIndex--;
                 }
                 hot = dragIndex;
                 Relayout(true);
@@ -590,21 +613,27 @@ void Dock::OnMouse(UINT msg, float x, float y, WPARAM) {
         return;
     }
     if (msg == WM_LBUTTONUP) {
-        if (dragging) {   // persist the new pinned order
-            std::vector<std::wstring> order;
-            for (auto &it : items) if (it.pinned) order.push_back(it.id);
-            g_set.pinned = order;
-            SaveSettings();
-            dragging = false; dragIndex = -1;
-            Rebuild();
-            return;
-        }
-        int h = HitItem(cx);
-        dragIndex = -1;
-        Activate(h, false);
+        if (dragging) { EndDrag(true); return; }
+        EndDrag(false);
+        Activate(HitItem(cx), false);
         return;
     }
     if (msg == WM_RBUTTONUP) { Activate(HitItem(cx), true); return; }
+}
+
+// finish a press on a pinned icon: save the new order if it was dragged
+void Dock::EndDrag(bool commit) {
+    bool moved = dragging;
+    dragging = false;
+    dragIndex = -1;
+    if (GetCapture() == hwnd) ReleaseCapture();   // sends WM_CAPTURECHANGED; state is already clear
+    if (commit && moved) {
+        std::vector<std::wstring> order;
+        for (auto &it : items) if (it.pinned) order.push_back(it.id);
+        g_set.pinned = order;
+        SaveSettings();
+    }
+    if (moved) Rebuild();
 }
 
 void Dock::Activate(int i, bool rightClick) {
@@ -772,9 +801,23 @@ void DockPeriodicRefresh() {
     g_dock->Rebuild();
 }
 
+static bool g_dockFsHidden = false;   // hidden because a full-screen app covers its monitor
+
 void DockReassert() {
-    if (g_dock && g_dock->hwnd)
+    if (g_dock && g_dock->hwnd && !g_dockFsHidden)
         SetWindowPos(g_dock->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+// like the panel: step aside for a full-screen app on the Dock's monitor
+void DockFullscreenSync() {
+    if (!g_dock || !g_dock->hwnd) { g_dockFsHidden = false; return; }
+    bool fs = MonitorHasFullscreen(MonitorFromWindow(g_dock->hwnd, MONITOR_DEFAULTTOPRIMARY));
+    // compare with the real visibility too: a Dock rebuilt during full screen
+    // (display change, Explorer restart) starts visible
+    if (fs == g_dockFsHidden && (!fs || !IsWindowVisible(g_dock->hwnd))) return;
+    g_dockFsHidden = fs;
+    if (fs) ShowWindow(g_dock->hwnd, SW_HIDE);
+    else SetWindowPos(g_dock->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 // ===================================================== window previews ======

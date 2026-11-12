@@ -150,6 +150,9 @@ struct Bar : Surface {
     void OnPaint() override;
     void OnMouse(UINT msg, float x, float y, WPARAM) override;
     void OnMouseLeave() override { if (hot != -1) { hot = -1; Invalidate(); } }
+    LRESULT OnMessage(UINT msg, WPARAM wp, LPARAM lp, bool &handled) override;
+    ULONGLONG lastFix = 0;   // throttle for the work-area watchdog
+    bool fsHidden = false;   // hidden because a full-screen app is on this monitor
     void Rebuild();
     void OpenLogoMenu(float x);
     void OpenAppMenu(int i, float x);
@@ -491,7 +494,46 @@ static void PlaceBar(Bar *b, MONITORINFO &mi) {
         r = abd.rc;
     }
     b->Move(r);
-    SetWindowPos(b->hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(b->hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOACTIVATE | (b->fsHidden ? 0 : SWP_SHOWWINDOW));
+}
+
+static void ReplaceBar(Bar *b) {
+    MONITORINFO mi = {sizeof(mi)};
+    if (GetMonitorInfo(b->mon, &mi)) PlaceBar(b, mi);
+}
+
+// Explorer re-lays out every AppBar when the taskbar's auto-hide state, another
+// AppBar, or the display changes, and sends ABN_POSCHANGED. An AppBar that
+// doesn't answer with QUERYPOS/SETPOS can lose its reserved strip, and then
+// maximized windows slide under the panel.
+LRESULT Bar::OnMessage(UINT msg, WPARAM wp, LPARAM, bool &handled) {
+    if (msg == WM_GG_TRAY) {
+        handled = true;
+        if (wp == ABN_POSCHANGED && g_set.menubar) ReplaceBar(this);
+        return 0;
+    }
+    handled = false;
+    return 0;
+}
+
+// Watchdog: if the monitor's work area no longer starts below the panel, the
+// reservation was dropped (Explorer restart races, taskbar state changes).
+// Re-register and re-place, at most every 3 s so it can never fight Explorer.
+static void EnsureReserved(Bar *b) {
+    if (!g_set.menubar) return;
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfo(b->mon, &mi)) return;
+    RECT wr; GetWindowRect(b->hwnd, &wr);
+    if (mi.rcWork.top >= wr.bottom) return;
+    ULONGLONG now = GetTickCount64();
+    if (now - b->lastFix < 3000) return;
+    b->lastFix = now;
+    APPBARDATA abd = {sizeof(abd)};
+    abd.hWnd = b->hwnd;
+    SHAppBarMessage(ABM_REMOVE, &abd);
+    RegisterAppBar(b, true);
+    PlaceBar(b, mi);
 }
 
 static BOOL CALLBACK MonCb(HMONITOR mon, HDC, LPRECT, LPARAM) {
@@ -518,8 +560,24 @@ static BOOL CALLBACK MonCb(HMONITOR mon, HDC, LPRECT, LPARAM) {
 void CALLBACK MenuBarTimer(HWND, UINT, UINT_PTR, DWORD) {
     for (auto *b : g_bars) {
         b->Invalidate();   // clock tick
-        // stay above a newly-activated or maximized window
-        SetWindowPos(b->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        EnsureReserved(b);
+        // stay above a newly-activated or maximized window (not a full-screen one)
+        if (!b->fsHidden)
+            SetWindowPos(b->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+// A full-screen app (YouTube full screen, F11, a game) gets the whole monitor:
+// hide that monitor's panel, and bring it back when the app leaves full screen
+// or another window comes to the top. The strip stays reserved meanwhile, so
+// maximized windows don't jump.
+void MenuBarFullscreenSync() {
+    for (auto *b : g_bars) {
+        bool fs = MonitorHasFullscreen(b->mon);
+        if (fs == b->fsHidden) continue;
+        b->fsHidden = fs;
+        if (fs) ShowWindow(b->hwnd, SW_HIDE);
+        else SetWindowPos(b->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 }
 
@@ -529,7 +587,8 @@ void MenuBarRetint() {
 
 void MenuBarReassert() {
     for (auto *b : g_bars)
-        SetWindowPos(b->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!b->fsHidden)
+            SetWindowPos(b->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 void MenuBarStart() {
