@@ -198,13 +198,21 @@ std::wstring AppNameFor(HWND h) {
 
 // --------------------------------------------------------------- app list ---
 static std::vector<AppEntry> g_apps;
-std::vector<AppEntry> &AllApps(bool refresh) {
-    if (!g_apps.empty() && !refresh) return g_apps;
-    for (auto &a : g_apps) if (a.pidl) CoTaskMemFree(a.pidl);
-    g_apps.clear();
+static ULONGLONG g_appsAt = 0;            // when g_apps was last read
+static volatile LONG g_appsBusy = 0;      // a background refresh is running
+
+static void FreeApps(std::vector<AppEntry> &v) {
+    for (auto &a : v) if (a.pidl) CoTaskMemFree(a.pidl);
+    v.clear();
+}
+
+// Read the app list: everything in Start's "All apps" (shell:AppsFolder), which
+// includes desktop programs, Store apps, web apps and the Windows Tools. Touches
+// only the vector it returns, so it can run on a background thread.
+static std::vector<AppEntry> EnumApps() {
+    std::vector<AppEntry> out;
     IShellItem *appsFolder = nullptr;
-    // shell:AppsFolder enumerates desktop + Store apps that show in the app list
-    if (FAILED(SHCreateItemFromParsingName(L"shell:AppsFolder", nullptr, IID_PPV_ARGS(&appsFolder)))) return g_apps;
+    if (FAILED(SHCreateItemFromParsingName(L"shell:AppsFolder", nullptr, IID_PPV_ARGS(&appsFolder)))) return out;
     IEnumShellItems *en = nullptr;
     if (SUCCEEDED(appsFolder->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&en))) && en) {
         IShellItem *item;
@@ -246,14 +254,166 @@ std::vector<AppEntry> &AllApps(bool refresh) {
                 e.exe = Lower(FileNameOf(e.id));
                 if (e.target.empty() && e.id.find(L":\\") != std::wstring::npos) e.target = e.id;
             }
-            if (!e.name.empty()) g_apps.push_back(e);
+            if (!e.name.empty()) out.push_back(e);
             else if (e.pidl) CoTaskMemFree(e.pidl);
             item->Release();
         }
         en->Release();
     }
     appsFolder->Release();
+    return out;
+}
+
+std::vector<AppEntry> &AllApps(bool refresh) {
+    if (!g_apps.empty() && !refresh) return g_apps;
+    std::vector<AppEntry> fresh = EnumApps();
+    FreeApps(g_apps);
+    g_apps = std::move(fresh);
+    g_appsAt = GetTickCount64();
     return g_apps;
+}
+
+// Re-read the app list in the background, so apps installed or removed since
+// Golden Gate started show up (in Spotlight, Launchpad, the Dock) without a
+// restart and without the UI waiting the second or so the shell takes. The new
+// list is handed to the UI thread (WM_GG_APPS -> AppsSwap) and swapped in there,
+// so nothing reading g_apps ever sees it half-built.
+void AppsRefreshAsync(DWORD minAgeMs) {
+    if (GetTickCount64() - g_appsAt < minAgeMs) return;
+    if (InterlockedCompareExchange(&g_appsBusy, 1, 0) != 0) return;
+    HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        auto *v = new std::vector<AppEntry>(EnumApps());
+        CoUninitialize();
+        if (!PostMessageW(g_main, WM_GG_APPS, 0, (LPARAM)v)) { FreeApps(*v); delete v; InterlockedExchange(&g_appsBusy, 0); }
+        return 0;
+    }, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    else InterlockedExchange(&g_appsBusy, 0);
+}
+
+// UI thread: take the list a background refresh built. An empty result (the
+// shell wasn't ready) keeps the old list rather than wiping every app.
+bool AppsSwap(LPARAM lp) {
+    auto *v = (std::vector<AppEntry> *)lp;
+    InterlockedExchange(&g_appsBusy, 0);
+    g_appsAt = GetTickCount64();
+    bool changed = false;
+    if (v && !v->empty()) {
+        changed = v->size() != g_apps.size();
+        for (size_t i = 0; !changed && i < v->size(); i++)
+            changed = (*v)[i].id != g_apps[i].id || (*v)[i].name != g_apps[i].name;
+        if (changed) { FreeApps(g_apps); g_apps = std::move(*v); }
+    }
+    if (v) { FreeApps(*v); delete v; }
+    return changed;
+}
+
+// --------------------------------------------- Windows' own app menu ---
+// The menu Windows shows when you right-click an app in Start's "All apps":
+// Open, Open file location, Run as administrator, Uninstall, Pin to Start, and
+// the app's own extras (VS Code's "Open new window"). We ask the shell for it
+// (IContextMenu, documented) and show its items in our own menu style; picking
+// one hands that command straight back to the shell, so each does exactly what
+// it does in Start, UAC prompt included.
+struct ShellMenuHolder {
+    IContextMenu *cm = nullptr;
+    HMENU hm = nullptr;
+    ~ShellMenuHolder() {
+        if (hm) DestroyMenu(hm);
+        if (cm) cm->Release();
+    }
+};
+
+static IContextMenu *ContextMenuFor(PCIDLIST_ABSOLUTE pidl) {
+    IShellFolder *parent = nullptr;
+    PCUITEMID_CHILD child = nullptr;
+    if (!pidl || FAILED(SHBindToParent(pidl, IID_PPV_ARGS(&parent), &child))) return nullptr;
+    IContextMenu *cm = nullptr;
+    parent->GetUIObjectOf(nullptr, 1, &child, IID_IContextMenu, nullptr, (void **)&cm);
+    parent->Release();
+    return cm;
+}
+
+static bool InvokeCm(IContextMenu *cm, LPCSTR verb, LPCWSTR verbW) {
+    CMINVOKECOMMANDINFOEX ci = {sizeof(ci)};
+    ci.fMask = CMIC_MASK_UNICODE | CMIC_MASK_FLAG_LOG_USAGE;
+    ci.hwnd = nullptr;
+    ci.lpVerb = verb;
+    ci.lpVerbW = verbW;
+    ci.nShow = SW_SHOWNORMAL;
+    HRESULT hr = cm->InvokeCommand((LPCMINVOKECOMMANDINFO)&ci);
+    // cancelling the UAC prompt isn't a failure to report
+    return SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_CANCELLED);
+}
+
+std::vector<MenuItem> AppShellMenu(const std::wstring &id, std::function<void()> before) {
+    std::vector<MenuItem> out;
+    const AppEntry *a = FindApp(id);
+    IContextMenu *cm = a ? ContextMenuFor(a->pidl) : nullptr;
+    if (!cm) return out;
+    auto holder = std::make_shared<ShellMenuHolder>();
+    holder->cm = cm;
+    holder->hm = CreatePopupMenu();
+    const UINT first = 1;
+    if (!holder->hm || FAILED(cm->QueryContextMenu(holder->hm, 0, first, 0x7FFF, CMF_NORMAL))) return out;
+    int n = GetMenuItemCount(holder->hm);
+    for (int i = 0; i < n; i++) {
+        wchar_t text[256] = {};
+        MENUITEMINFOW mi = {sizeof(mi)};
+        mi.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STRING | MIIM_SUBMENU | MIIM_STATE;
+        mi.dwTypeData = text;
+        mi.cch = 255;
+        if (!GetMenuItemInfoW(holder->hm, i, TRUE, &mi)) continue;
+        if (mi.fType & MFT_SEPARATOR) {
+            if (!out.empty() && !out.back().separator) out.push_back(MenuItem::Sep());
+            continue;
+        }
+        // skip submenus (Send to, Share...) that the shell fills lazily, items
+        // drawn by an extension with no text, and hidden/disabled ones
+        if (mi.hSubMenu || !text[0] || (mi.fState & MFS_DISABLED)) continue;
+        std::wstring t = text;
+        size_t tab = t.find(L'\t');
+        if (tab != std::wstring::npos) t.resize(tab);
+        t.erase(std::remove(t.begin(), t.end(), L'&'), t.end());
+        MenuItem m;
+        m.text = t;
+        UINT cmd = mi.wID - first;
+        m.action = [holder, cmd, before]() {
+            if (before) before();
+            InvokeCm(holder->cm, MAKEINTRESOURCEA(cmd), MAKEINTRESOURCEW(cmd));
+        };
+        out.push_back(m);
+    }
+    while (!out.empty() && out.back().separator) out.pop_back();
+    return out;
+}
+
+// Run an app with one of its shell verbs ("runas" = Run as administrator).
+// Returns false when the app has no such command (Store apps can't be elevated).
+bool InvokeAppVerb(const std::wstring &id, const wchar_t *verb) {
+    const AppEntry *a = FindApp(id);
+    IContextMenu *cm = a ? ContextMenuFor(a->pidl) : nullptr;
+    if (!cm) return false;
+    bool ok = false;
+    HMENU hm = CreatePopupMenu();
+    if (hm && SUCCEEDED(cm->QueryContextMenu(hm, 0, 1, 0x7FFF, CMF_NORMAL))) {
+        // only offer the verb if the shell actually lists it for this app
+        char buf[64] = {};
+        int n = GetMenuItemCount(hm);
+        std::string want;
+        for (const wchar_t *p = verb; *p; p++) want += (char)*p;
+        for (int i = 0; i < n && !ok; i++) {
+            UINT id2 = GetMenuItemID(hm, i);
+            if (id2 == (UINT)-1 || id2 < 1) continue;
+            buf[0] = 0;
+            if (SUCCEEDED(cm->GetCommandString(id2 - 1, GCS_VERBA, nullptr, buf, sizeof(buf))) && _stricmp(buf, want.c_str()) == 0)
+                ok = InvokeCm(cm, MAKEINTRESOURCEA(id2 - 1), MAKEINTRESOURCEW(id2 - 1));
+        }
+    }
+    if (hm) DestroyMenu(hm);
+    cm->Release();
+    return ok;
 }
 
 const AppEntry *FindApp(const std::wstring &id) {

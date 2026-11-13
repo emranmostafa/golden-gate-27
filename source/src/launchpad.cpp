@@ -129,6 +129,7 @@ void Launchpad::Close() {
 
 void LaunchpadToggle() {
     if (g_lp) { g_lp->Close(); return; }
+    AppsRefreshAsync();   // newly installed apps appear next time it opens
     g_lp = new Launchpad();
     HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi = {sizeof(mi)};
@@ -163,23 +164,87 @@ struct Spotlight : Surface {
     void Run(int i);
     void Close();
     void Resize();
+    void ShowMenu(int i, int x, int y);
+    bool menuOpen = false;   // we opened a right-click menu (close it with us)
 };
 static Spotlight *g_sl = nullptr;
+
+void SpotlightAppsChanged() {
+    if (g_sl && !g_sl->closing && !(g_sl->menuOpen && PopupMenuOpen())) g_sl->Search();
+}
+
+// How well an app matches what was typed: lower is better, -1 is no match.
+// Like Start's search it looks at the name (whole, start, start of any word, the
+// initials) and at the program's file name, so "code", "vsc", "cmd", "regedit"
+// and "studio code" all find their app.
+static int MatchScore(const AppEntry &a, const std::wstring &q) {
+    std::wstring n = Lower(a.name);
+    if (n == q) return 0;
+    std::wstring stem = a.exe;   // "cmd.exe" -> "cmd"
+    if (stem.size() > 4) stem.resize(stem.size() - 4);
+    // typing the exact program name ("cmd", "regedit") finds that program first,
+    // as Start does: Command Prompt before Git CMD
+    if (!stem.empty() && stem == q) return 1;
+    if (n.compare(0, q.size(), q) == 0) return 1;
+    for (size_t i = 1; i + q.size() <= n.size(); i++)
+        if (!iswalnum(n[i - 1]) && n.compare(i, q.size(), q) == 0) return 2;
+    if (!stem.empty() && stem.compare(0, q.size(), q) == 0) return 3;
+    if (q.size() >= 2) {
+        std::wstring initials;
+        bool start = true;
+        for (wchar_t c : n) {
+            if (iswalnum(c)) { if (start) initials += c; start = false; }
+            else start = true;
+        }
+        if (initials.compare(0, q.size(), q) == 0) return 3;
+    }
+    if (n.find(q) != std::wstring::npos) return 4;
+    // several words, each somewhere in the name: "studio code"
+    if (q.find(L' ') != std::wstring::npos) {
+        bool all = true, any = false;
+        size_t p = 0;
+        while (p < q.size() && all) {
+            size_t e = q.find(L' ', p);
+            if (e == std::wstring::npos) e = q.size();
+            if (e > p) { any = true; all = n.find(q.substr(p, e - p)) != std::wstring::npos; }
+            p = e + 1;
+        }
+        if (all && any) return 5;
+    }
+    if (q.size() >= 3 && !stem.empty() && stem.find(q) != std::wstring::npos) return 6;
+    return -1;
+}
 
 void Spotlight::Search() {
     results.clear();
     std::wstring q = Lower(query);
+    while (!q.empty() && q.back() == L' ') q.pop_back();
+    while (!q.empty() && q.front() == L' ') q.erase(q.begin());
     if (!q.empty()) {
+        // rank every match, best first; the old search took the first 6 in
+        // alphabetical order, so a good match late in the alphabet never showed
+        struct Hit { int score; const AppEntry *a; };
+        std::vector<Hit> hits;
+        std::set<std::wstring> seen;   // one row per name (the shell can list an app twice)
         for (auto &a : AllApps()) {
-            if (Lower(a.name).find(q) == std::wstring::npos) continue;
+            int s = MatchScore(a, q);
+            if (s >= 0) hits.push_back({s, &a});
+        }
+        std::stable_sort(hits.begin(), hits.end(), [](const Hit &x, const Hit &y) {
+            if (x.score != y.score) return x.score < y.score;
+            if (x.a->name.size() != y.a->name.size()) return x.a->name.size() < y.a->name.size();
+            return _wcsicmp(x.a->name.c_str(), y.a->name.c_str()) < 0;
+        });
+        for (auto &h : hits) {
+            if (!seen.insert(Lower(h.a->name)).second) continue;
             Result r;
-            r.title = a.name;
+            r.title = h.a->name;
             r.sub = L"Application";
-            r.action = a.id;
+            r.action = h.a->id;
             r.kind = 0;
-            r.icon = AppIcon(a.id, 64);
+            r.icon = AppIcon(h.a->id, 64);
             results.push_back(r);
-            if (results.size() >= 6) break;
+            if (results.size() >= 7) break;   // 7 apps + the web row fill the 8 rows
         }
         // a web search and a direct "open" fallback
         Result web;
@@ -239,12 +304,67 @@ void Spotlight::OnMouse(UINT msg, float x, float y, WPARAM) {
     if (i >= 0 && i < (int)results.size()) {
         if (i != sel) { sel = i; Invalidate(); }
         if (msg == WM_LBUTTONUP) Run(i);
+        else if (msg == WM_RBUTTONUP) {
+            POINT p;
+            GetCursorPos(&p);
+            ShowMenu(i, p.x, p.y);
+        }
     }
 }
 
+// Right-click on an app: Windows' own menu for it (Run as administrator, Open
+// file location, Uninstall, Pin to Start...), plus Keep in Dock. The menu never
+// takes focus, so Spotlight stays open behind it until a command is chosen.
+void Spotlight::ShowMenu(int i, int x, int y) {
+    if (i < 0 || i >= (int)results.size() || results[i].kind != 0) return;
+    std::wstring id = results[i].action;
+    auto items = AppShellMenu(id, []() { if (g_sl) g_sl->Close(); });
+    if (items.empty()) {   // the shell had no menu for it: at least offer Open
+        MenuItem open;
+        open.text = L"Open";
+        open.action = [id]() { if (g_sl) g_sl->Close(); LaunchApp(id); };
+        items.push_back(open);
+    }
+    bool pinned = std::find(g_set.pinned.begin(), g_set.pinned.end(), id) != g_set.pinned.end();
+    items.push_back(MenuItem::Sep());
+    MenuItem dock;
+    dock.text = pinned ? L"Remove from Dock" : L"Keep in Dock";
+    dock.action = [id, pinned]() {
+        if (pinned) g_set.pinned.erase(std::remove(g_set.pinned.begin(), g_set.pinned.end(), id), g_set.pinned.end());
+        else g_set.pinned.push_back(id);
+        SaveSettings();
+        DockRefresh();
+    };
+    items.push_back(dock);
+    menuOpen = true;
+    PopupMenu(items, x, y, hwnd, 200);
+}
+
 void Spotlight::OnKey(UINT vk) {
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    if (menuOpen && PopupMenuOpen()) {   // a key while the menu is up closes it first
+        ClosePopupMenus();
+        menuOpen = false;
+        if (vk == VK_ESCAPE) return;
+    }
     if (vk == VK_ESCAPE) { Close(); return; }
+    // Ctrl+Shift+Enter runs the app as administrator, as in Start
+    if (vk == VK_RETURN && ctrl && shift) {
+        if (sel >= 0 && sel < (int)results.size() && results[sel].kind == 0) {
+            std::wstring id = results[sel].action;
+            Close();
+            if (!InvokeAppVerb(id, L"runas")) MessageBeep(MB_ICONWARNING);   // a Store app can't be
+        }
+        return;
+    }
     if (vk == VK_RETURN) { Run(sel); return; }
+    // the menu key or Shift+F10 opens the selected app's menu under its row
+    if (vk == VK_APPS || (vk == VK_F10 && shift)) {
+        RECT wr;
+        GetWindowRect(hwnd, &wr);
+        ShowMenu(sel, wr.left + (int)(60 * scale), wr.top + (int)((56 + (sel + 1) * 52) * scale));
+        return;
+    }
     if (vk == VK_BACK) { if (!query.empty()) { query.pop_back(); caretOn = true; lastBlink = GetTickCount64(); Search(); } return; }
     if (vk == VK_DOWN && sel < (int)results.size() - 1) { sel++; Invalidate(); }
     if (vk == VK_UP && sel > 0) { sel--; Invalidate(); }
@@ -273,6 +393,7 @@ void Spotlight::Run(int i) {
 void Spotlight::Close() {
     if (closing) return;
     closing = true;
+    if (menuOpen) ClosePopupMenus();   // don't leave its right-click menu floating
     if (tick) { KillTimer(nullptr, tick); tick = 0; }
     Destroy();          // detaches us from the window first, so no re-entry
     g_sl = nullptr;
@@ -281,6 +402,9 @@ void Spotlight::Close() {
 
 void SpotlightToggle() {
     if (g_sl) { g_sl->Close(); return; }
+    // pick up apps installed or removed since the list was last read; this runs
+    // in the background and the results refresh themselves when it lands
+    AppsRefreshAsync();
     g_sl = new Spotlight();
     HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi = {sizeof(mi)};

@@ -335,6 +335,8 @@ static int g_flyWhich = -1;                 // page we opened (-1: opened some o
 static int g_flyBoxTop[2] = {-1, -1};       // content top within the window, last seen per page
 static int g_flyBoxTopAny = -1;             // ...and for whatever was shown last
 static HWINEVENTHOOK g_flyShowHook = nullptr, g_flyUncloakHook = nullptr;
+static ULONGLONG g_flyLastShown = 0;        // last tick the popup was seen open
+static int g_flyLastPage = -1;              // the page it was showing then (outlives FlyoutStop)
 
 static void FlyoutStop() {
     if (g_flyTimer) { KillTimer(nullptr, g_flyTimer); g_flyTimer = 0; }
@@ -390,6 +392,8 @@ static void CALLBACK FlyoutTick(HWND, UINT, UINT_PTR, DWORD) {
         return;
     }
     g_flyGoneSince = 0;
+    g_flyLastShown = now;
+    g_flyLastPage = g_flyWhich;
     FlyoutPlace(g_fly);
 }
 
@@ -428,7 +432,29 @@ void FlyoutHooksStop() {
 
 // which: 0 sound output (Win+Ctrl+V), 1 Wi-Fi list
 void OpenWindowsFlyout(int which) {
+    // Clicking the same icon again closes it, like the tray icons. The panel never
+    // takes focus, so the click doesn't count as "clicking away" and Windows left
+    // the popup open, then re-opened the same page. It may also have closed itself
+    // a moment before our click handler runs, so "open within the last 350 ms on
+    // this page" counts as open too; then there's nothing to do but not reopen it.
+    HWND cur = FindWindowW(L"ControlCenterWindow", nullptr);
+    ULONGLONG now = GetTickCount64();
+    bool showing = FlyoutShowing(cur);
+    bool samePage = g_flyLastPage == which;
+    if (samePage && (showing || now - g_flyLastShown < 350)) {
+        if (showing) {
+            // Esc closes it, sent only once it really has the keyboard: a stray
+            // Esc must never land in the app you were using
+            SetForegroundWindow(cur);
+            if (GetForegroundWindow() == cur) SendKeys({VK_ESCAPE});
+        }
+        g_flyLastShown = 0;
+        g_flyLastPage = -1;
+        FlyoutStop();
+        return;
+    }
     g_flyWhich = which;
+    g_flyLastPage = which;
     // move the hidden popup window to where this page's content sat last time, so
     // it appears under the panel instead of sliding up from the bottom first
     HWND f = FindWindowW(L"ControlCenterWindow", nullptr);

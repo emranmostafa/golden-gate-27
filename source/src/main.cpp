@@ -247,6 +247,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         DockRefresh();
         MenuBarRefresh();
         return 0;
+    case WM_GG_APPS:   // a background re-read of the app list finished
+        if (AppsSwap(lp)) { SpotlightAppsChanged(); DockRefresh(); }
+        return 0;
     case WM_CLIPBOARDUPDATE:
         ClipboardOnChange();
         return 0;

@@ -195,6 +195,9 @@ struct AppEntry {
     PIDLIST_ABSOLUTE pidl = nullptr;   // the Start-menu item itself (icon + launch), owned by the app list
 };
 std::vector<AppEntry> &AllApps(bool refresh = false);
+void AppsRefreshAsync(DWORD minAgeMs = 10000);   // re-read the app list off the UI thread
+bool AppsSwap(LPARAM lp);                        // WM_GG_APPS: take the new list; true if it changed
+bool InvokeAppVerb(const std::wstring &id, const wchar_t *verb);   // e.g. "runas"
 const AppEntry *FindApp(const std::wstring &id);
 const AppEntry *FindAppForWindow(const std::wstring &aumid, const std::wstring &exe);   // app ID wins over exe
 std::wstring CanonicalAppId(const std::wstring &id);   // bare "app.exe" pins -> their Start-menu id
@@ -234,6 +237,7 @@ void MissionControlToggle();
 void SwitcherStep(bool start);
 void LaunchpadToggle();
 void SpotlightToggle();
+void SpotlightAppsChanged();   // the app list was re-read: redo an open search
 void ClipboardStart(); void ClipboardStop(); void ClipboardShow(RECT anchor);
 void CaffeineSet(bool on);
 void ShakeTimerTick();
@@ -255,6 +259,9 @@ struct MenuItem {
     static MenuItem Sep() { MenuItem m; m.separator = true; return m; }
 };
 void PopupMenu(std::vector<MenuItem> items, int x, int y, HWND owner = nullptr, float minWidth = 0);
+// Windows' own right-click menu for an app (Open, Run as administrator, Open file
+// location, Uninstall...); `before` runs just before the chosen command
+std::vector<MenuItem> AppShellMenu(const std::wstring &id, std::function<void()> before = nullptr);
 void ClosePopupMenus();
 bool PopupMenuOpen();
 // Dock right-click on a running app: live previews of its windows + its actions
@@ -266,6 +273,7 @@ bool WindowPreviewsOpen();
 #define WM_GG_TRAY        (WM_APP + 1)
 #define WM_GG_THEME       (WM_APP + 2)
 #define WM_GG_REFRESH     (WM_APP + 3)
+#define WM_GG_APPS        (WM_APP + 4)   // lParam: new app list from a background refresh
 enum { HK_MISSION = 1, HK_SWITCH, HK_SPOTLIGHT, HK_LAUNCHPAD };
 extern HWND g_main;                  // hidden message window
 extern UINT g_msgTaskbarCreated;
