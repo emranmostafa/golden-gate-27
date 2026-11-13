@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.4.3 — Spotlight finds every app, right-click menu, popups toggle
+- **Spotlight finds every app:** results are ranked best match first instead of
+  the first six in alphabetical order, and an app is found by its name, the
+  start of any word in it, its initials or its program name ("code", "vsc",
+  "cmd", "regedit", "studio code"). Apps installed or removed while Golden Gate
+  runs show up the next time Spotlight or Launchpad opens; the list is re-read
+  in the background, so neither waits for it.
+- **Right-click in Spotlight:** right-click an app (or press the menu key or
+  Shift+F10) for Windows' own menu for it: Open, Run as administrator, Open
+  file location, Uninstall, Pin to Start and the app's own extras, plus Keep in
+  Dock. Ctrl+Shift+Enter runs the selected app as administrator, as in Start.
+- **Volume and Wi-Fi popups toggle:** clicking the panel's volume or network
+  icon again closes its popup instead of leaving it open.
+
 ## v2.4.2 — Panel space, full screen, Dock reordering
 - **Panel keeps its space:** when Windows rearranges the screen edges (the
   taskbar switching to auto-hide at start-up, Explorer restarting, another

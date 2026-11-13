@@ -566,6 +566,6 @@ void ShowConfirm(const std::wstring &title, const std::wstring &body, const std:
     OpenDialog(title, body, okText, ok, false);
 }
 void ShowAbout() {
-    OpenDialog(L"About", L"Version 2.4.2\n\nA desktop layer that runs beside Windows. Nothing in Windows is patched.\n\nFree software under the GPL-3.0. Includes Bibata cursors and MacTahoe icons (GPL-3.0), code from KDE Plasma (GPL-2.0+) and the Inter font (OFL). Golden Gate is not affiliated with Apple.",
+    OpenDialog(L"About", L"Version 2.4.3\n\nA desktop layer that runs beside Windows. Nothing in Windows is patched.\n\nFree software under the GPL-3.0. Includes Bibata cursors and MacTahoe icons (GPL-3.0), code from KDE Plasma (GPL-2.0+) and the Inter font (OFL). Golden Gate is not affiliated with Apple.",
                L"OK", nullptr, true);
 }
