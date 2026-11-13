@@ -12,7 +12,7 @@ programs.
 
 ## Install
 1. Download `GoldenGate-Setup.exe` from the
-   [latest release](https://github.com/emranmostafa/golden-gate-27/releases/latest)
+   [latest release](https://github.com/emranmostafa/golden-gate-windows/releases/latest)
    and run it (per-user install; SmartScreen may warn for an unsigned build —
    choose **More info → Run anyway**). To update, run the newer installer; your
    settings are kept.

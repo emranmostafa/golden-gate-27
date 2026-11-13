@@ -8,7 +8,7 @@ version. It is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. The full license text is in LICENSE-GPL-3.0.txt.
 
-Source code: https://github.com/emranmostafa/golden-gate-27
+Source code: https://github.com/emranmostafa/golden-gate-windows
 
 Golden Gate is made of original code plus the following open-source
 components, redistributed under their licenses. Golden Gate is not affiliated
